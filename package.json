@@ -1,0 +1,33 @@
+{
+  "name": "voteweb-backend",
+  "version": "1.0.0",
+  "description": "Backend API for voting web application",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "migrate": "node migrate.js up",
+    "migrate:status": "node migrate.js status",
+    "migrate:down": "node migrate.js down",
+    "migrate:reset": "node migrate.js reset",
+    "seed": "node seed.js"
+  },
+  "keywords": [
+    "voting",
+    "election",
+    "backend",
+    "api"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.3.0",
+    "pg": "^8.23.0"
+  }
+}

@@ -1,0 +1,98 @@
+const { Pool } = require('pg');
+const dbConfig = require('../config/database');
+const config = require('../config');
+
+// Build connection configuration
+const getPoolConfig = () => {
+  // Support DATABASE_URL for easy configuration
+  if (process.env.DATABASE_URL) {
+    return {
+      connectionString: process.env.DATABASE_URL,
+      // Apply SSL when DB_SSL=true (required by hosted Postgres like Render)
+      ssl: config.dbSsl,
+      ...dbConfig.pool,
+    };
+  }
+
+  // Individual connection parameters
+  return {
+    host: dbConfig.host,
+    port: dbConfig.port,
+    database: dbConfig.database,
+    user: dbConfig.user,
+    password: dbConfig.password,
+    ssl: config.dbSsl,
+    ...dbConfig.pool,
+  };
+};
+
+// Create the connection pool
+const pool = new Pool(getPoolConfig());
+
+// Handle pool errors
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle database client:', err.message);
+});
+
+// Health check function - executes SELECT 1
+const healthCheck = async () => {
+  const start = Date.now();
+  const result = await pool.query('SELECT 1 AS health_check');
+  const duration = Date.now() - start;
+  return {
+    status: 'ok',
+    responseTime: `${duration}ms`,
+    timestamp: new Date().toISOString(),
+  };
+};
+
+// Graceful shutdown
+const close = async () => {
+  console.log('Closing database connection pool...');
+  await pool.end();
+  console.log('Database connection pool closed.');
+};
+
+/**
+ * Audit log function for administrative operations
+ *
+ * SECURITY NOTE: This logs administrative actions without exposing
+ * sensitive information like passwords, tokens, or candidate choices.
+ *
+ * Schema: id, actor_id, actor_type, action, entity_type, entity_id, metadata, ip_address, created_at
+ */
+const auditLog = async (eventType, details) => {
+  try {
+    await pool.query(
+      `INSERT INTO audit_logs (actor_id, actor_type, action, entity_type, entity_id, metadata, ip_address, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+      [
+        details.adminUserId || null,
+        details.adminUserId ? 'ADMIN' : 'SYSTEM',
+        eventType,
+        details.entityType || 'ELECTION',
+        details.entityId || null,
+        JSON.stringify({
+          // Only safe metadata - no passwords, tokens, or candidate choices
+          name: details.name,
+          status: details.status,
+          previousStatus: details.previousStatus,
+          newStatus: details.newStatus,
+          electionId: details.electionId,
+        }),
+        details.ipAddress || null,
+      ]
+    );
+  } catch (err) {
+    // Log failures should not break the main operation
+    console.error('Audit log failed:', err.message);
+  }
+};
+
+module.exports = {
+  pool,
+  query: pool.query.bind(pool),
+  healthCheck,
+  close,
+  auditLog,
+};

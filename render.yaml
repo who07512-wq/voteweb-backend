@@ -1,0 +1,64 @@
+// yaml
+services:
+  # Backend API Service
+  - type: web
+    name: voteweb-backend
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm install
+    preDeployCommand: npm run migrate
+    startCommand: node src/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: voteweb-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: TOTP_ENCRYPTION_KEY
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: CORS_ORIGIN
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: DB_SSL
+        value: "true"
+    healthCheckPath: /api/health
+    autoDeploy: true
+ 
+  # Frontend Service
+  - type: web
+    name: voteweb-frontend
+    runtime: node
+    plan: free
+    rootDir: voteweb-Frontend
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          name: voteweb-backend
+          property: env
+          key: RENDER_EXTERNAL_URL
+      - key: NEXT_PUBLIC_APP_URL
+        fromService:
+          name: voteweb-frontend
+          property: env
+          key: RENDER_EXTERNAL_URL
+    autoDeploy: true
+ 
+  # PostgreSQL Database (free: expires after 30 days)
+  - type: database
+    name: voteweb-db
+    plan: free
+    databaseName: voteweb
+    ipAllowList: []

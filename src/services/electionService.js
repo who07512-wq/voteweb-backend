@@ -1,0 +1,447 @@
+/**
+ * Election Service
+ * Business logic for election management
+ */
+
+const db = require('../db');
+
+// Valid status transitions
+const STATUS_TRANSITIONS = {
+  DRAFT: ['SCHEDULED', 'OPEN'],
+  SCHEDULED: ['OPEN'],
+  OPEN: ['CLOSED'],
+  CLOSED: ['PUBLISHED'], // Allow publishing results after closing
+};
+
+// Fields that can be updated when election is OPEN
+const PROTECTED_FIELDS_WHEN_OPEN = ['name', 'start_time', 'end_time'];
+
+// Fields that can be updated when election is CLOSED
+const PROTECTED_FIELDS_WHEN_CLOSED = ['name', 'description', 'start_time', 'end_time', 'status'];
+
+class ElectionService {
+  /**
+   * Find all elections
+   */
+  async findAll(options = {}) {
+    const { status, limit = 100, offset = 0 } = options;
+
+    let query = 'SELECT * FROM elections';
+    const params = [];
+
+    if (status) {
+      query += ' WHERE status = $1';
+      params.push(status);
+    }
+
+    query += ' ORDER BY id LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
+    params.push(limit, offset);
+
+    const result = await db.query(query, params);
+    return result.rows;
+  }
+
+  /**
+   * Find election by ID
+   */
+  async findById(id) {
+    const result = await db.query(
+      'SELECT * FROM elections WHERE id = $1',
+      [id]
+    );
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Check if status transition is valid
+   */
+  isValidTransition(currentStatus, newStatus) {
+    const allowed = STATUS_TRANSITIONS[currentStatus] || [];
+    return allowed.includes(newStatus);
+  }
+
+  /**
+   * Create a new election
+   */
+  async create(data) {
+    const { name, description, start_time, end_time } = data;
+
+    const result = await db.query(
+      `INSERT INTO elections (name, description, start_time, end_time, status)
+       VALUES ($1, $2, $3, $4, 'DRAFT')
+       RETURNING *`,
+      [name, description || null, start_time || null, end_time || null]
+    );
+
+    return result.rows[0];
+  }
+
+  /**
+   * Update an election (non-status fields)
+   */
+  async update(id, data) {
+    const election = await this.findById(id);
+    if (!election) return null;
+
+    // Check immutability based on status
+    if (election.status === 'OPEN') {
+      const attemptedProtected = PROTECTED_FIELDS_WHEN_OPEN.filter(f => data[f] !== undefined);
+      if (attemptedProtected.length > 0) {
+        const error = new Error('Cannot modify protected fields when election is OPEN');
+        error.code = 'PROTECTED_FIELD';
+        error.fields = attemptedProtected;
+        throw error;
+      }
+    }
+
+    if (election.status === 'CLOSED') {
+      const attemptedProtected = PROTECTED_FIELDS_WHEN_CLOSED.filter(f => data[f] !== undefined);
+      if (attemptedProtected.length > 0) {
+        const error = new Error('Cannot modify fields when election is CLOSED');
+        error.code = 'ELECTION_CLOSED';
+        error.fields = attemptedProtected;
+        throw error;
+      }
+    }
+
+    // Build update query dynamically
+    const updates = [];
+    const params = [];
+    let paramIndex = 1;
+
+    const allowedFields = ['name', 'description', 'start_time', 'end_time'];
+
+    for (const field of allowedFields) {
+      if (data[field] !== undefined) {
+        updates.push(`${field} = $${paramIndex}`);
+        params.push(data[field]);
+        paramIndex++;
+      }
+    }
+
+    if (updates.length === 0) {
+      return election;
+    }
+
+    updates.push(`updated_at = NOW()`);
+    params.push(id);
+
+    const query = `UPDATE elections SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
+    const result = await db.query(query, params);
+    return result.rows[0];
+  }
+
+  /**
+   * Update election status with transition validation
+   */
+  async updateStatus(id, newStatus) {
+    const election = await this.findById(id);
+    if (!election) return { error: 'NOT_FOUND' };
+
+    const previousStatus = election.status;
+
+    // Validate transition
+    if (!this.isValidTransition(election.status, newStatus)) {
+      return {
+        error: 'INVALID_TRANSITION',
+        message: `Cannot transition from ${election.status} to ${newStatus}`,
+        currentStatus: election.status,
+        allowedTransitions: STATUS_TRANSITIONS[election.status] || [],
+      };
+    }
+
+    // Build update query with conditional results_published_at
+    let query = `UPDATE elections SET status = $1, updated_at = NOW()`;
+    const params = [newStatus];
+
+    // Set results_published_at when publishing results
+    if (newStatus === 'PUBLISHED') {
+      query += `, results_published_at = NOW(), results_published_by = $2`;
+      params.push(1); // Admin user ID placeholder
+    }
+
+    query += ` WHERE id = $${params.length + 1} RETURNING *`;
+    params.push(id);
+
+    const result = await db.query(query, params);
+
+    return { election: result.rows[0], previousStatus };
+  }
+
+  /**
+   * Check if election has dependent data (clubs)
+   */
+  async hasDependentData(id) {
+    const result = await db.query(
+      'SELECT COUNT(*) as count FROM clubs WHERE election_id = $1',
+      [id]
+    );
+    return parseInt(result.rows[0].count) > 0;
+  }
+
+  /**
+   * Check election readiness before opening
+   */
+  async getReadiness(id) {
+    // Check election exists
+    const electionResult = await db.query(
+      'SELECT id, name, status, start_time, end_time FROM elections WHERE id = $1',
+      [id]
+    );
+
+    if (electionResult.rows.length === 0) {
+      return { error: 'NOT_FOUND' };
+    }
+
+    const election = electionResult.rows[0];
+
+    // Count clubs
+    const clubsResult = await db.query(
+      'SELECT COUNT(*) as count FROM clubs WHERE election_id = $1 AND is_active = true',
+      [id]
+    );
+
+    // Count positions across all clubs
+    const positionsResult = await db.query(
+      `SELECT COUNT(*) as count FROM positions p
+       JOIN clubs c ON p.club_id = c.id
+       WHERE c.election_id = $1 AND p.is_active = true`,
+      [id]
+    );
+
+    // Count candidates across all positions
+    const candidatesResult = await db.query(
+      `SELECT COUNT(*) as count FROM candidates c
+       JOIN positions p ON c.position_id = p.id
+       JOIN clubs cl ON p.club_id = cl.id
+       WHERE cl.election_id = $1 AND c.is_active = true`,
+      [id]
+    );
+
+    // Count authorized students
+    const authResult = await db.query(
+      'SELECT COUNT(*) as count FROM voter_authorizations WHERE election_id = $1',
+      [id]
+    );
+
+    const clubCount = parseInt(clubsResult.rows[0].count);
+    const positionCount = parseInt(positionsResult.rows[0].count);
+    const candidateCount = parseInt(candidatesResult.rows[0].count);
+    const authorizedCount = parseInt(authResult.rows[0].count);
+
+    // Determine readiness
+    const checks = {
+      hasClubs: {
+        status: clubCount > 0 ? 'pass' : 'fail',
+        message: clubCount > 0 ? 'Has clubs' : 'No clubs configured',
+        count: clubCount,
+      },
+      hasPositions: {
+        status: positionCount > 0 ? 'pass' : 'fail',
+        message: positionCount > 0 ? 'Has positions' : 'No positions configured',
+        count: positionCount,
+      },
+      hasCandidates: {
+        status: candidateCount > 0 ? 'pass' : 'fail',
+        message: candidateCount > 0 ? 'Has candidates' : 'No candidates configured',
+        count: candidateCount,
+      },
+      hasAuthorizedStudents: {
+        status: authorizedCount > 0 ? 'pass' : 'warn',
+        message: authorizedCount > 0 ? 'Has authorized students' : 'No students authorized (may be intentional)',
+        count: authorizedCount,
+      },
+    };
+
+    // Calculate overall readiness
+    const criticalPassed = checks.hasClubs.status === 'pass' &&
+                          checks.hasPositions.status === 'pass' &&
+                          checks.hasCandidates.status === 'pass';
+
+    const warnings = Object.entries(checks)
+      .filter(([_, check]) => check.status === 'warn')
+      .map(([name, check]) => ({ name, message: check.message }));
+
+    return {
+      election_id: id,
+      election_name: election.name,
+      current_status: election.status,
+      ready_to_open: criticalPassed,
+      checks,
+      warnings,
+    };
+  }
+
+  /**
+   * Get aggregated election results
+   * Only returns results if election has results_published_at set
+   * Aggregates votes by candidate without exposing individual vote records
+   */
+  async getResults(id) {
+    // Get election with results status
+    const electionResult = await db.query(
+      `SELECT id, name, status, results_published_at
+       FROM elections
+       WHERE id = $1`,
+      [id]
+    );
+
+    if (!electionResult.rows[0]) {
+      return { error: 'NOT_FOUND' };
+    }
+
+    const election = electionResult.rows[0];
+
+    // Check if results are published
+    if (!election.results_published_at) {
+      return { error: 'NOT_PUBLISHED' };
+    }
+
+    // Get total eligible students
+    const eligibleResult = await db.query(
+      `SELECT COUNT(DISTINCT student_id) as count
+       FROM voter_authorizations
+       WHERE election_id = $1 AND is_authorized = true`,
+      [id]
+    );
+    const totalEligible = parseInt(eligibleResult.rows[0].count) || 0;
+
+    // Get total votes cast
+    const votesResult = await db.query(
+      `SELECT COUNT(DISTINCT student_id) as count
+       FROM votes
+       WHERE election_id = $1`,
+      [id]
+    );
+    const totalVotes = parseInt(votesResult.rows[0].count) || 0;
+
+    // Calculate participation percentage
+    const participation = totalEligible > 0
+      ? Math.round((totalVotes / totalEligible) * 10000) / 100
+      : 0;
+
+    // Get clubs for this election
+    const clubsResult = await db.query(
+      `SELECT id, name FROM clubs WHERE election_id = $1 AND is_active = true ORDER BY display_order`,
+      [id]
+    );
+
+    // Get positions and candidates with vote counts
+    const positionsResult = await db.query(
+      `SELECT
+         p.id as position_id,
+         p.name as position_name,
+         p.club_id,
+         cand.id as candidate_id,
+         cand.name as candidate_name,
+         COUNT(v.id) as vote_count
+       FROM positions p
+       JOIN clubs c ON c.id = p.club_id
+       JOIN candidates cand ON cand.position_id = p.id AND cand.is_active = true
+       LEFT JOIN votes v ON v.position_id = p.id AND v.candidate_id = cand.id
+       WHERE c.election_id = $1 AND p.is_active = true
+       GROUP BY p.id, p.name, p.club_id, cand.id, cand.name
+       ORDER BY p.display_order, cand.display_order`,
+      [id]
+    );
+
+    // Get total votes per position (for percentage calculation)
+    const votesPerPositionResult = await db.query(
+      `SELECT position_id, COUNT(*) as vote_count
+       FROM votes
+       WHERE election_id = $1
+       GROUP BY position_id`,
+      [id]
+    );
+    const votesPerPosition = {};
+    votesPerPositionResult.rows.forEach(row => {
+      votesPerPosition[row.position_id] = parseInt(row.vote_count);
+    });
+
+    // Format the response
+    const clubs = clubsResult.rows.map(club => {
+      const clubPositions = positionsResult.rows.filter(p => p.club_id === club.id);
+      const positionGroups = {};
+
+      clubPositions.forEach(p => {
+        if (!positionGroups[p.position_id]) {
+          positionGroups[p.position_id] = {
+            positionId: p.position_id,
+            positionName: p.position_name,
+            candidates: [],
+          };
+        }
+
+        const voteCount = parseInt(p.vote_count) || 0;
+        const totalVotesForPosition = votesPerPosition[p.position_id] || 0;
+        const percentage = totalVotesForPosition > 0
+          ? Math.round((voteCount / totalVotesForPosition) * 10000) / 100
+          : 0;
+
+        positionGroups[p.position_id].candidates.push({
+          candidateId: p.candidate_id,
+          candidateName: p.candidate_name,
+          voteCount,
+          percentage,
+        });
+      });
+
+      // Calculate ranks within each position
+      Object.values(positionGroups).forEach(pos => {
+        pos.candidates.sort((a, b) => b.voteCount - a.voteCount);
+        pos.candidates.forEach((c, idx) => {
+          c.rank = idx + 1;
+        });
+      });
+
+      return {
+        clubId: club.id,
+        clubName: club.name,
+        positions: Object.values(positionGroups),
+      };
+    });
+
+    return {
+      electionId: id,
+      electionName: election.name,
+      publishedAt: election.results_published_at,
+      status: 'published',
+      totalEligible,
+      totalVotes,
+      participation,
+      clubs,
+    };
+  }
+
+  /**
+   * Publish election results
+   * Sets results_published_at timestamp
+   */
+  async publishResults(id, adminUserId) {
+    const election = await this.findById(id);
+    if (!election) return { error: 'NOT_FOUND' };
+
+    // Can only publish if election is CLOSED
+    if (election.status !== 'CLOSED') {
+      return {
+        error: 'INVALID_STATE',
+        message: `Cannot publish results. Election must be CLOSED (current: ${election.status})`,
+      };
+    }
+
+    const result = await db.query(
+      `UPDATE elections
+       SET status = 'PUBLISHED',
+           results_published_at = NOW(),
+           results_published_by = $1,
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [adminUserId, id]
+    );
+
+    return { election: result.rows[0] };
+  }
+}
+
+module.exports = new ElectionService();

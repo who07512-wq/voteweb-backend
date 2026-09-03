@@ -1,0 +1,331 @@
+/**
+ * Vote Controller
+ * HTTP handling for vote submission
+ *
+ * CRITICAL SECURITY BOUNDARY:
+ * - Student identity comes exclusively from req.user (authenticated session)
+ * - Request body/params student_id is IGNORED for authenticated users
+ * - Prevents impersonation attacks (IDOR)
+ */
+
+const voteService = require('../services/voteService');
+const db = require('../db');
+
+class VoteController {
+  /**
+   * POST /api/v1/elections/:electionId/votes
+   * Submit a vote for a candidate
+   *
+   * Security: Student identity comes from req.user, never from request body
+   */
+  async submitVote(req, res, next) {
+    try {
+      const { electionId } = req.params;
+      const { club_id, position_id, candidate_id, student_id: bodyStudentId } = req.body;
+
+      // SECURITY: Get student identity from authenticated session ONLY
+      // NEVER trust student_id from request body for production
+      const authenticatedStudentId = req.user?.studentId;
+
+      if (!authenticatedStudentId) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      // DEVELOPMENT BACKWARD COMPATIBILITY:
+      // If body contains student_id AND matches authenticated user, allow it (for dev testing)
+      // If body contains different student_id, reject it (security)
+      if (bodyStudentId) {
+        if (bodyStudentId !== authenticatedStudentId) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Cannot vote as another student.',
+            code: 'IMPERSONATION_ATTEMPT',
+          });
+        }
+        // bodyStudentId matches authenticated user - proceed
+      }
+
+      // Use authenticated identity
+      const studentId = authenticatedStudentId;
+
+      // Validation: required fields
+      if (!club_id || !position_id || !candidate_id) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'club_id, position_id, and candidate_id are required.',
+        });
+      }
+
+      // Parse IDs
+      const clubId = parseToInt(club_id);
+      const positionId = parseToInt(position_id);
+      const candidateId = parseToInt(candidate_id);
+      const electionIdInt = parseToInt(electionId);
+
+      // Validate formats
+      if ([clubId, positionId, candidateId, electionIdInt].some(isNaN)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid ID format.',
+        });
+      }
+
+      // Call vote service with authenticated identity
+      const result = await voteService.castVote({
+        studentId,
+        electionId: electionIdInt,
+        clubId,
+        positionId,
+        candidateId,
+      });
+
+      if (!result.success) {
+        return res.status(result.status).json({
+          error: result.error,
+          code: result.code,
+        });
+      }
+
+      res.status(201).json({
+        data: {
+          success: true,
+          message: 'Vote recorded successfully.',
+          receipt: result.receipt,
+        },
+      });
+
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/elections/:electionId/votes/check
+   * Check if the authenticated student has voted in this election
+   *
+   * Security: Student identity from session only, not from query params
+   */
+  async checkVotes(req, res, next) {
+    try {
+      const { electionId } = req.params;
+      const { position_ids } = req.query;
+
+      // SECURITY: Get student identity from authenticated session ONLY
+      const authenticatedStudentId = req.user?.studentId;
+
+      if (!authenticatedStudentId) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      // SECURITY: Never accept student_id from query params (prevents IDOR)
+      // If someone tries ?student_id=123, we ignore it and use authenticated identity
+      const studentId = authenticatedStudentId;
+
+      const electionIdInt = parseToInt(electionId);
+      if (isNaN(electionIdInt)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid electionId format.',
+        });
+      }
+
+      // Parse position_ids if provided
+      let positionIdList = null;
+      if (position_ids) {
+        positionIdList = position_ids.split(',').map(id => parseInt(id));
+        if (positionIdList.some(isNaN)) {
+          return res.status(400).json({
+            error: 'Bad Request',
+            message: 'Invalid position_ids format',
+          });
+        }
+      }
+
+      const result = await voteService.checkVotes(studentId, electionIdInt, positionIdList);
+
+      res.json({
+        data: {
+          voted_positions: result.votedPositions,
+          can_vote: result.canVote,
+        }
+      });
+
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/elections/:electionId/votes/receipt
+   * Get the authenticated student's receipt for an election (no voteId needed)
+   *
+   * Security: Only allow access to own receipts
+   */
+  async getMyElectionReceipt(req, res, next) {
+    try {
+      const { electionId } = req.params;
+
+      // SECURITY: Get student identity from authenticated session ONLY
+      const authenticatedStudentId = req.user?.studentId;
+
+      if (!authenticatedStudentId) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      const electionIdInt = parseToInt(electionId);
+
+      if (isNaN(electionIdInt)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid ID format.',
+        });
+      }
+
+      // SECURITY: Ownership enforced in query - only returns rows owned by this student
+      const receiptResult = await db.query(
+        `SELECT id, receipt_hash, nullifier, created_at
+         FROM vote_receipts
+         WHERE student_id = $1 AND election_id = $2
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [authenticatedStudentId, electionIdInt]
+      );
+
+      if (receiptResult.rows.length === 0) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'No receipt found for this election.',
+          code: 'RECEIPT_NOT_FOUND',
+        });
+      }
+
+      res.json({
+        data: {
+          receipt: {
+            receiptId: receiptResult.rows[0].id,
+            receiptHash: receiptResult.rows[0].receipt_hash,
+            nullifier: receiptResult.rows[0].nullifier,
+            createdAt: receiptResult.rows[0].created_at,
+          },
+        },
+      });
+
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/elections/:electionId/votes/receipt/:voteId
+   * Get vote receipt for the authenticated student
+   *
+   * Security: Only allow access to own receipts
+   */
+  async getReceipt(req, res, next) {
+    try {
+      const { electionId, voteId } = req.params;
+
+      // SECURITY: Get student identity from authenticated session ONLY
+      const authenticatedStudentId = req.user?.studentId;
+
+      if (!authenticatedStudentId) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      const electionIdInt = parseToInt(electionId);
+      const voteIdInt = parseToInt(voteId);
+
+      if (isNaN(electionIdInt) || isNaN(voteIdInt)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid ID format.',
+        });
+      }
+
+      // SECURITY: Ownership check - only allow access to own receipts
+      const result = await db.query(
+        `SELECT v.*, c.name as candidate_name, p.name as position_name,
+                e.name as election_name
+         FROM votes v
+         JOIN candidates c ON c.id = v.candidate_id
+         JOIN positions p ON p.id = v.position_id
+         JOIN elections e ON e.id = v.election_id
+         WHERE v.id = $1 AND v.election_id = $2`,
+        [voteIdInt, electionIdInt]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Vote not found.',
+          code: 'VOTE_NOT_FOUND',
+        });
+      }
+
+      const vote = result.rows[0];
+
+      // SECURITY: Ownership check - student can only see their own receipt
+      if (vote.student_id !== authenticatedStudentId) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Cannot access another student\'s vote receipt.',
+          code: 'ACCESS_DENIED',
+        });
+      }
+
+      // Fetch the existing stored receipt (created at vote time) - do NOT regenerate
+      const receiptResult = await db.query(
+        `SELECT id, receipt_hash, nullifier, created_at
+         FROM vote_receipts
+         WHERE vote_id = $1`,
+        [voteIdInt]
+      );
+
+      let receipt;
+      if (receiptResult.rows.length > 0) {
+        receipt = {
+          receiptId: receiptResult.rows[0].id,
+          receiptHash: receiptResult.rows[0].receipt_hash,
+          nullifier: receiptResult.rows[0].nullifier,
+          createdAt: receiptResult.rows[0].created_at,
+        };
+      } else {
+        // Backward compatibility: no stored receipt, return a one-time digest without persisting
+        receipt = await voteService.generateReceipt(vote.id, electionIdInt, vote.student_id);
+      }
+
+      res.json({
+        data: {
+          receipt,
+        },
+      });
+
+    } catch (err) {
+      next(err);
+    }
+  }
+}
+
+// Helper to safely parse int
+function parseToInt(val) {
+  const parsed = parseInt(val);
+  return isNaN(parsed) ? val : parsed;
+}
+
+module.exports = new VoteController();

@@ -1,0 +1,47 @@
+// gitignore
+# Dependencies
+node_modules/
+ 
+# Environment files
+.env
+.env.local
+.env.*.local
+pass.env
+*.env
+.env.production
+.env.staging
+.env.test
+.env.development
+ 
+# Local debugging artifacts
+cookies.txt
+ 
+# Logs
+logs/
+*.log
+npm-debug.log*
+ 
+# OS files
+.DS_Store
+Thumbs.db
+ 
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+ 
+# Build output
+dist/
+build/
+ 
+# Coverage
+coverage/
+ 
+# Development credentials (LOCAL ONLY)
+DEV-ACCOUNT.md
+*dev*.md
+
+# Environment files (contains secrets)
+.env
+*.local
