@@ -115,6 +115,8 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
     const adminList = String(process.env.ADMIN_EMAILS || '')
       .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+    const cadList = String(process.env.CAD_EMAILS || '')
+      .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
 
     // ---- 4. Find the account (or auto-provision) ----
     // Identity is tied to student_id; the login email is a changeable
@@ -156,7 +158,9 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       // Invited admins are created straight as ADMIN; others as CANDIDATE or STUDENT
       const roleToUse = isInvitedAdmin
         ? 'ADMIN'
-        : ['STUDENT', 'CANDIDATE'].includes(requestedRoleRaw) ? requestedRoleRaw : 'STUDENT';
+        : ['STUDENT', 'CANDIDATE', 'CAD'].includes(requestedRoleRaw)
+          ? (requestedRoleRaw === 'CAD' && cadList.includes(email) ? 'CAD' : requestedRoleRaw === 'CAD' ? 'STUDENT' : requestedRoleRaw)
+          : 'STUDENT';
 
       const inserted = await db.query(
         `INSERT INTO students (external_id, name, email, password_hash, role, is_active, username)
@@ -166,6 +170,14 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       ).then((r) => r.rows[0]);
       account = inserted;
       console.log('clerk-session: provisioned invited account', { email, role: roleToUse });
+    } else if (cadList.includes(email) && account.role !== 'CAD' && account.role !== 'ADMIN') {
+      // Bootstrap: promote listed CAD emails at sign-in
+      const promoted = await db.query(
+        `UPDATE students SET role = 'CAD' WHERE id = $1 RETURNING role`,
+        [account.id]
+      ).then((r) => r.rows[0]);
+      account.role = promoted.role;
+      console.log('clerk-session: bootstrapped CAD', { email });
     } else if (adminList.includes(email) && account.role !== 'ADMIN') {
       // Bootstrap: promote listed emails to ADMIN on sign-in
       const promoted = await db.query(
