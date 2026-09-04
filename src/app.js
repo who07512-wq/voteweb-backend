@@ -14,6 +14,8 @@ const adminCandidateAppRoutes = require('./routes/adminCandidateApplications');
 const authorizationRoutes = require('./routes/authorization');
 const authRoutes = require('./routes/auth');
 const clerkAuthRoutes = require('./routes/clerkAuth');
+const emailRecoveryRoutes = require('./routes/emailRecovery');
+const adminEmailRecoveryRoutes = require('./routes/adminEmailRecovery');
 const clubController = require('./controllers/clubController');
 const positionController = require('./controllers/positionController');
 const candidateController = require('./controllers/candidateController');
@@ -286,6 +288,7 @@ app.post('/api/debug/test-register', async (req, res) => {
 // Auth routes (login, logout, MFA, etc.)
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/auth', clerkAuthRoutes); // Clerk Google sign-in bridge
+app.use('/api/v1/auth', emailRecoveryRoutes); // public: can't access your registered email?
 
 // Elections (public read for published elections)
 app.use('/api/v1/elections', electionRoutes);
@@ -361,6 +364,7 @@ app.use('/api/v1/admin/candidate-applications', requireAdmin, adminCandidateAppR
 app.use('/api/v1/admin/authorizations', requireAdmin, adminAuthorization);
 app.use('/api/v1/admin/announcements', requireAdmin, adminAnnouncements);
 app.use('/api/v1/admin/support', requireAdmin, adminSupport);
+app.use('/api/v1/admin/email-recovery', requireAdmin, adminEmailRecoveryRoutes);
 
 // Admin authorization management
 app.get('/api/v1/admin/elections/:electionId/authorizations', requireAdmin, authController.list.bind(authController));
