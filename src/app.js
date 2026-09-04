@@ -13,6 +13,7 @@ const candidateApplicationRoutes = require('./routes/candidateApplications');
 const adminCandidateAppRoutes = require('./routes/adminCandidateApplications');
 const authorizationRoutes = require('./routes/authorization');
 const authRoutes = require('./routes/auth');
+const clerkAuthRoutes = require('./routes/clerkAuth');
 const clubController = require('./controllers/clubController');
 const positionController = require('./controllers/positionController');
 const candidateController = require('./controllers/candidateController');
@@ -284,6 +285,7 @@ app.post('/api/debug/test-register', async (req, res) => {
 
 // Auth routes (login, logout, MFA, etc.)
 app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/auth', clerkAuthRoutes); // Clerk Google sign-in bridge
 
 // Elections (public read for published elections)
 app.use('/api/v1/elections', electionRoutes);
