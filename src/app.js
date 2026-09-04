@@ -20,6 +20,7 @@ const accessRequestRoutes = require('./routes/accessRequests');
 const adminAccessRequestRoutes = require('./routes/adminAccessRequests');
 const cadRoutes = require('./routes/cad');
 const adminStats = require('./controllers/adminStats');
+const adminAuditLogs = require('./controllers/adminAuditLogs');
 const clubController = require('./controllers/clubController');
 const positionController = require('./controllers/positionController');
 const candidateController = require('./controllers/candidateController');
@@ -372,6 +373,7 @@ app.use('/api/v1/admin/support', requireAdmin, adminSupport);
 app.use('/api/v1/admin/email-recovery', requireAdmin, adminEmailRecoveryRoutes);
 app.use('/api/v1/admin/access-requests', requireAdmin, adminAccessRequestRoutes);
 app.use('/api/v1/admin/stats', requireAdmin, adminStats.getStats);
+app.get('/api/v1/admin/audit-logs', requireAdmin, adminAuditLogs.list);
 
 // Admin authorization management
 app.get('/api/v1/admin/elections/:electionId/authorizations', requireAdmin, authController.list.bind(authController));
