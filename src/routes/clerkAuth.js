@@ -117,8 +117,19 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
 
     // ---- 4. Find the account (or auto-provision) ----
+    // Identity is tied to student_id; the login email is a changeable
+    // credential. Priority: current_login_email > legacy email > official_email.
     let account = await db.query(
-      'SELECT * FROM students WHERE email = $1 AND is_active = TRUE',
+      `SELECT * FROM students
+        WHERE is_active = TRUE
+          AND (LOWER(current_login_email) = LOWER($1)
+            OR LOWER(email) = LOWER($1)
+            OR LOWER(official_email) = LOWER($1))
+        ORDER BY CASE
+          WHEN LOWER(current_login_email) = LOWER($1) THEN 0
+          WHEN LOWER(email) = LOWER($1) THEN 1
+          ELSE 2 END
+        LIMIT 1`,
       [email]
     ).then((r) => r.rows[0]);
 
