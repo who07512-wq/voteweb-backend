@@ -2,6 +2,8 @@
 
 A modular backend API for a voting web application, built with Node.js, Express.js, and PostgreSQL.
 
+> 🗳️ **Frontend lives in [`voteweb-frontend`](https://github.com/who07512-wq/voteweb-frontend)** — Next.js app deployed on Vercel. See [`INVITE-ONLY-LOGIN.md`](./INVITE-ONLY-LOGIN.md) for the complete authentication & invite-only access guide.
+
 ## Project Overview
 
 This is the backend foundation for a voting system that will eventually support:
