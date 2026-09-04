@@ -18,6 +18,8 @@ const emailRecoveryRoutes = require('./routes/emailRecovery');
 const adminEmailRecoveryRoutes = require('./routes/adminEmailRecovery');
 const accessRequestRoutes = require('./routes/accessRequests');
 const adminAccessRequestRoutes = require('./routes/adminAccessRequests');
+const cadRoutes = require('./routes/cad');
+const adminStats = require('./controllers/adminStats');
 const clubController = require('./controllers/clubController');
 const positionController = require('./controllers/positionController');
 const candidateController = require('./controllers/candidateController');
@@ -369,6 +371,7 @@ app.use('/api/v1/admin/announcements', requireAdmin, adminAnnouncements);
 app.use('/api/v1/admin/support', requireAdmin, adminSupport);
 app.use('/api/v1/admin/email-recovery', requireAdmin, adminEmailRecoveryRoutes);
 app.use('/api/v1/admin/access-requests', requireAdmin, adminAccessRequestRoutes);
+app.use('/api/v1/admin/stats', requireAdmin, adminStats.getStats);
 
 // Admin authorization management
 app.get('/api/v1/admin/elections/:electionId/authorizations', requireAdmin, authController.list.bind(authController));
@@ -380,6 +383,9 @@ app.get('/api/v1/admin/elections/:id/readiness', requireAdmin, (req, res, next) 
   const controller = new ElectionController();
   controller.getReadiness.bind(controller)(req, res, next);
 });
+
+// CAD election-monitor routes (CAD or ADMIN role)
+app.use('/api/v1/cad', cadRoutes);
 
 // =====================================================
 // 404 HANDLER
