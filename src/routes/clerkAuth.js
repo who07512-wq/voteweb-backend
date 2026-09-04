@@ -170,22 +170,23 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       ).then((r) => r.rows[0]);
       account = inserted;
       console.log('clerk-session: provisioned invited account', { email, role: roleToUse });
-    } else if (cadList.includes(email) && account.role !== 'CAD' && account.role !== 'ADMIN') {
-      // Bootstrap: promote listed CAD emails at sign-in
-      const promoted = await db.query(
-        `UPDATE students SET role = 'CAD' WHERE id = $1 RETURNING role`,
-        [account.id]
-      ).then((r) => r.rows[0]);
-      account.role = promoted.role;
-      console.log('clerk-session: bootstrapped CAD', { email });
     } else if (adminList.includes(email) && account.role !== 'ADMIN') {
-      // Bootstrap: promote listed emails to ADMIN on sign-in
+      // Bootstrap: promote listed emails to ADMIN on sign-in.
+      // Checked FIRST: ADMIN always wins when an email is on both lists.
       const promoted = await db.query(
         `UPDATE students SET role = 'ADMIN' WHERE id = $1 RETURNING role`,
         [account.id]
       ).then((r) => r.rows[0]);
       account.role = promoted.role;
       console.log('clerk-session: bootstrapped admin', { email });
+    } else if (cadList.includes(email) && account.role !== 'CAD' && account.role !== 'ADMIN') {
+      // Bootstrap: promote listed CAD emails at sign-in (only if not ADMIN)
+      const promoted = await db.query(
+        `UPDATE students SET role = 'CAD' WHERE id = $1 RETURNING role`,
+        [account.id]
+      ).then((r) => r.rows[0]);
+      account.role = promoted.role;
+      console.log('clerk-session: bootstrapped CAD', { email });
     }
 
     // ---- 5. Create backend session (cv_sid cookie set here) ----
