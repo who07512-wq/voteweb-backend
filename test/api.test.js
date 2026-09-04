@@ -164,8 +164,10 @@ test('logout works when binding token is present', async () => {
 // ============================================================
 test('ADMIN001 login returns authenticated:false with mfa required', async () => {
   const c = new TestClient(baseUrl);
+  // Role is required by the API (role separation); the frontend always sends
+  // it. Role-less logins default to STUDENT and are rejected for ADMIN.
   const res = await c.request('POST', '/api/v1/auth/login', {
-    body: { userIdentifier: 'ADMIN001', password: 'AdminPassword123!' },
+    body: { userIdentifier: 'ADMIN001', password: 'AdminPassword123!', role: 'ADMIN' },
   });
   assert.equal(res.status, 200);
   assert.equal(res.json.data.authenticated, false);

@@ -18,7 +18,8 @@ class CandidateApplicationController {
       // Validate required fields
       const requiredFields = [
         'fullName', 'enrollmentNumber', 'department', 'year',
-        'positionId', 'email', 'phone', 'bio', 'manifesto'
+        'positionId', 'email', 'phone', 'bio', 'manifesto',
+        'age', 'dateOfBirth', 'gender', 'aadharNumber'
       ];
 
       for (const field of requiredFields) {

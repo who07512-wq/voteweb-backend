@@ -12,14 +12,20 @@ class CandidateService {
   async findAll(options = {}) {
     const { activeOnly = true, limit = 100, offset = 0 } = options;
 
-    let query = 'SELECT * FROM candidates WHERE 1=1';
+    let query = `SELECT c.*,
+                        p.name AS position_name,
+                        cl.name AS club_name
+                 FROM candidates c
+                 JOIN positions p ON c.position_id = p.id
+                 JOIN clubs cl ON p.club_id = cl.id
+                 WHERE 1=1`;
     const params = [];
 
     if (activeOnly) {
-      query += ' AND is_active = true';
+      query += ' AND c.is_active = true';
     }
 
-    query += ' ORDER BY id LIMIT $1 OFFSET $2';
+    query += ' ORDER BY c.id LIMIT $1 OFFSET $2';
     params.push(limit, offset);
 
     const result = await db.query(query, params);

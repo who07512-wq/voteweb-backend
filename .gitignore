@@ -44,4 +44,5 @@ DEV-ACCOUNT.md
 
 # Environment files (contains secrets)
 .env
+.env.*
 *.local

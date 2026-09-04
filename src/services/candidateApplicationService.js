@@ -23,6 +23,10 @@ class CandidateApplicationService {
       profilePhotoUrl,
       bio,
       manifesto,
+      age,
+      dateOfBirth,
+      gender,
+      aadharNumber,
     } = data;
 
     // Check if enrollment number already has an application (not rejected)
@@ -57,12 +61,14 @@ class CandidateApplicationService {
       `INSERT INTO candidate_applications (
         student_id, full_name, enrollment_number, department, year, semester, section,
         position_id, email, phone, profile_photo_url, bio, manifesto,
+        age, date_of_birth, gender, aadhar_number,
         status, submitted_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'under_review', NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'under_review', NOW())
       RETURNING *`,
       [
         studentId, fullName, enrollmentNumber, department, year, semester || null, section || null,
         positionId, email, phone, profilePhotoUrl || null, bio || null, manifesto || null,
+        age || null, dateOfBirth || null, gender || null, aadharNumber || null,
       ]
     );
 
@@ -449,6 +455,10 @@ class CandidateApplicationService {
       profilePhotoUrl: row.profile_photo_url,
       bio: row.bio,
       manifesto: row.manifesto,
+      age: row.age,
+      dateOfBirth: row.date_of_birth,
+      gender: row.gender,
+      aadharNumber: row.aadhar_number,
       status: row.status,
       rejectionReason: row.rejection_reason,
       changesRequestedReason: row.changes_requested_reason,

@@ -51,7 +51,7 @@ const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3001')
   .split(',')
   .map(o => o.trim())
   .filter(Boolean)
-  .concat(['http://10.139.255.165:3001']);
+  .concat(['http://10.139.255.165:3001', 'http://127.0.0.1:3001']);
 
 const corsOptions = {
   origin: (origin, cb) => {

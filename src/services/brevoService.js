@@ -17,6 +17,12 @@ async function sendEmail({ to, subject, html, text }) {
   const apiKey = process.env.BREVO_API_KEY;
 
   if (!apiKey) {
+    // Development fallback: no Brevo key configured, so print the email
+    // (which contains the OTP) to the server log instead of failing.
+    if (process.env.NODE_ENV === 'development') {
+      console.log('[dev] Email not sent (BREVO_API_KEY missing). Contents:\n' + (text || ''));
+      return { dev: true };
+    }
     throw new Error('BREVO_API_KEY not configured');
   }
 
