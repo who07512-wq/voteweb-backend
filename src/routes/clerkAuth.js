@@ -105,9 +105,16 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       : null;
     const clientEmail = String(req.body.email || '').toLowerCase().trim();
     const email = primaryEmail || clientEmail;
+    const requestedRoleRaw = String(req.body.role || '').toUpperCase().trim();
     if (!email || !email.includes('@')) {
       return authError(res, 400, 'NO_EMAIL', 'Google account has no verified email address.');
     }
+
+    // ---- 3.5 Invite-only gate + admin bootstrap ----
+    const allowList = String(process.env.INVITED_EMAILS || '')
+      .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+    const adminList = String(process.env.ADMIN_EMAILS || '')
+      .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
 
     // ---- 4. Find the account (or auto-provision) ----
     let account = await db.query(
@@ -115,19 +122,31 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       [email]
     ).then((r) => r.rows[0]);
 
-    const requestedRole = String(req.body.role || '').toUpperCase();
-    const roleToUse = account
-      ? account.role
-      : ['STUDENT', 'CANDIDATE'].includes(requestedRole) ? requestedRole : 'STUDENT';
-
     if (!account) {
-      // Auto-provision a Google account. Password is random (Google login only).
+      // ---- Invite-only mode: unknown emails are rejected outright ----
+      if (process.env.INVITE_ONLY === 'true' && !allowList.includes(email)) {
+        await recordAudit('clerk_login_denied', {
+          studentId: null,
+          ip: req.ip,
+          metadata: { email, clerkUserId, reason: 'not_invited' },
+        });
+        return authError(res, 403, 'NOT_INVITED', 'This Google account has not been invited to CampusVote. Ask the election administrator for access.');
+      }
+
+      // ---- Auto-provision invited users only ----
       const name = String(req.body.name || '').trim() || email.split('@')[0];
       const usernameBase = email.split('@')[0].replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user';
       const username = `${usernameBase}.${randomBytes(3).toString('hex')}`;
       const randomPassword = randomBytes(24).toString('base64url');
       const passwordHash = await hashPassword(randomPassword);
       const externalId = `CLERK-${clerkUserId}`;
+      const isInvitedAdmin = adminList.includes(email);
+
+      // Invited admins are created straight as ADMIN; others as CANDIDATE or STUDENT
+      const roleToUse = isInvitedAdmin
+        ? 'ADMIN'
+        : ['STUDENT', 'CANDIDATE'].includes(requestedRoleRaw) ? requestedRoleRaw : 'STUDENT';
+
       const inserted = await db.query(
         `INSERT INTO students (external_id, name, email, password_hash, role, is_active, username)
          VALUES ($1, $2, $3, $4, $5, TRUE, $6)
@@ -135,7 +154,15 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
         [externalId, name, email, passwordHash, roleToUse, username]
       ).then((r) => r.rows[0]);
       account = inserted;
-      console.log('clerk-session: auto-provisioned account', { email, role: roleToUse });
+      console.log('clerk-session: provisioned invited account', { email, role: roleToUse });
+    } else if (adminList.includes(email) && account.role !== 'ADMIN') {
+      // Bootstrap: promote listed emails to ADMIN on sign-in
+      const promoted = await db.query(
+        `UPDATE students SET role = 'ADMIN' WHERE id = $1 RETURNING role`,
+        [account.id]
+      ).then((r) => r.rows[0]);
+      account.role = promoted.role;
+      console.log('clerk-session: bootstrapped admin', { email });
     }
 
     // ---- 5. Create backend session (cv_sid cookie set here) ----
