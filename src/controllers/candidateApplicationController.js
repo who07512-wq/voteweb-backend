@@ -18,7 +18,7 @@ class CandidateApplicationController {
       // Validate required fields
       const requiredFields = [
         'fullName', 'enrollmentNumber', 'department', 'year',
-        'positionId', 'email', 'phone', 'bio', 'manifesto',
+        'nominationClub', 'contestingPosition', 'email', 'phone', 'bio', 'manifesto',
         'age', 'dateOfBirth', 'gender', 'aadharNumber'
       ];
 
@@ -29,6 +29,37 @@ class CandidateApplicationController {
             message: `Missing required field: ${field}`,
           });
         }
+      }
+
+      // Validate against the official club nomination form lists
+      const NOMINATION_CLUBS = [
+        'SAHITYASHALA (LITERATURE AND POETRY CLUB) & RACHNAKAR (CREATIVE CLUB)',
+        'BOSCO SPARTANS (SPORTS CLUB)',
+        'PUBLICATION COMMITTEE',
+        'ECO CLUB',
+        'TECHNO SPARKS (TECHNO CLUB)',
+        'AARAMBH (ENTREPRENEURSHIP CLUB)',
+        'SOCIAL SYNERGY (SOCIAL MEDIA CLUB)',
+        'SOCIAL OUTREACH (PARIVARTAN CLUB)',
+        'CO-CURRICULAR & EXTRA CO-CURRICULAR ACTIVITIES CLUB',
+        'JHANKAAR (CULTURAL CLUB)',
+      ];
+      const CONTESTING_POSITIONS = [
+        'Vice President (Batch 2020)',
+        'Secretary (Batch 2021)',
+      ];
+
+      if (!NOMINATION_CLUBS.includes(String(applicationData.nominationClub).trim())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid club selected.',
+        });
+      }
+      if (!CONTESTING_POSITIONS.includes(String(applicationData.contestingPosition).trim())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid position selected.',
+        });
       }
 
       // Email validation
