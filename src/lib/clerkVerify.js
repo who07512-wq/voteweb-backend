@@ -34,6 +34,17 @@ function decodeJwtPayload(token) {
   }
 }
 
+// ---- Decode JWT header WITHOUT verifying (only to read kid/alg hints) ----
+function decodeJwtHeader(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    return JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
 // ---- Look up the Clerk user's primary email via the Backend API ----
 async function fetchClerkPrimaryEmail(secretKey, clerkUserId) {
   const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(clerkUserId)}`, {
@@ -79,7 +90,15 @@ async function verifyClerkSessionToken(token, clientEmail) {
   let payload;
   try {
     payload = await jwtVerify(token, getJwks(iss), { issuer: iss, audience: aud }).then((r) => r.payload);
-  } catch {
+  } catch (verifyErr) {
+    const header = decodeJwtHeader(token);
+    console.error('clerkVerify: jwtVerify failed', {
+      error: verifyErr.message,
+      code: verifyErr.code,
+      header,
+      hints: { iss, aud },
+      now: Date.now() / 1000,
+    });
     const err = new Error('Sign-in token is invalid or expired. Please sign in again.');
     err.code = 'INVALID_CLERK_TOKEN';
     err.status = 401;
