@@ -237,6 +237,9 @@ app.get('/api/debug/otp-code/:email', async (req, res) => {
 
 // DEV ONLY: Test endpoint that bypasses OTP for testing (use for development only)
 app.post('/api/debug/test-register', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Not available in production' });
+  }
   const { email, username, password, role } = req.body;
 
   if (!email || !username || !password || !role) {
