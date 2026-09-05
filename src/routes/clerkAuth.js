@@ -155,11 +155,13 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       const externalId = `CLERK-${clerkUserId}`;
       const isInvitedAdmin = adminList.includes(email);
 
-      // Invited admins are created straight as ADMIN; others as CANDIDATE or STUDENT
+      // Invited admins are created straight as ADMIN.
+      // CANDIDATE is NEVER granted at signup — it is earned when an admin
+      // approves the candidate application (candidateApplicationService.approve).
       const roleToUse = isInvitedAdmin
         ? 'ADMIN'
-        : ['STUDENT', 'CANDIDATE', 'CAD'].includes(requestedRoleRaw)
-          ? (requestedRoleRaw === 'CAD' && cadList.includes(email) ? 'CAD' : requestedRoleRaw === 'CAD' ? 'STUDENT' : requestedRoleRaw)
+        : requestedRoleRaw === 'CAD' && cadList.includes(email)
+          ? 'CAD'
           : 'STUDENT';
 
       const inserted = await db.query(

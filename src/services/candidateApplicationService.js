@@ -245,6 +245,17 @@ class CandidateApplicationService {
       [adminId, id]
     );
 
+    // Approval is what EARNS the applicant the CANDIDATE role. The login-time
+    // role picker no longer grants it — this is the only promotion path.
+    const appId = result.rows[0].student_id;
+    if (appId) {
+      await db.query(
+        `UPDATE students SET role = 'CANDIDATE', updated_at = NOW()
+         WHERE id = $1 AND role IN ('STUDENT', 'CANDIDATE')`,
+        [appId]
+      );
+    }
+
     return this.formatApplication(result.rows[0]);
   }
 
@@ -279,6 +290,17 @@ class CandidateApplicationService {
        RETURNING *`,
       [reason, adminId, id]
     );
+
+    // If this applicant was promoted by a previous approval that was later
+    // reversed, drop them back to STUDENT (never touch ADMIN/CAD accounts).
+    const appId = result.rows[0].student_id;
+    if (appId) {
+      await db.query(
+        `UPDATE students SET role = 'STUDENT', updated_at = NOW()
+         WHERE id = $1 AND role = 'CANDIDATE'`,
+        [appId]
+      );
+    }
 
     return this.formatApplication(result.rows[0]);
   }
