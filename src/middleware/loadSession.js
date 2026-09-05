@@ -68,7 +68,7 @@ async function loadSession(req, res, next) {
     const result = await db.query(
       `SELECT s.*, st.external_id, st.name, st.email, st.role, st.is_active,
               st.password_change_required, st.mfa_enabled, st.mfa_secret_encrypted,
-              st.password_hash
+              st.password_hash, st.roll_number
          FROM sessions s
          JOIN students st ON st.id = s.student_id
         WHERE s.session_hash = $1
@@ -117,6 +117,7 @@ async function loadSession(req, res, next) {
       name: row.name,
       fullName: row.name,
       email: row.email,
+      rollNumber: row.roll_number || null,
 
       // Role (ADMIN, CANDIDATE, STUDENT)
       role: row.role,
