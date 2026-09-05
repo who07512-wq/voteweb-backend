@@ -84,13 +84,43 @@ class StudentService {
    * Update student
    */
   async update(id, data) {
-    const { name, email } = data;
+    const { name, email, voting_eligible, role } = data;
+
+    // Build SET clauses dynamically so partial updates only touch given fields
+    const sets = [];
+    const values = [];
+    let idx = 1;
+
+    if (name !== undefined && name !== null) {
+      sets.push(`name = $${idx++}`);
+      values.push(name);
+    }
+    if (email !== undefined) {
+      sets.push(`email = $${idx++}`);
+      values.push(email);
+    }
+    if (voting_eligible !== undefined) {
+      sets.push(`voting_eligible = $${idx++}`);
+      values.push(voting_eligible);
+    }
+    if (role !== undefined) {
+      sets.push(`role = $${idx++}`);
+      values.push(role);
+    }
+
+    if (sets.length === 0) {
+      const existing = await db.query('SELECT * FROM students WHERE id = $1', [id]);
+      return sanitizeStudent(existing.rows[0]) || null;
+    }
+
+    sets.push(`updated_at = NOW()`);
+    values.push(id);
 
     const result = await db.query(
-      `UPDATE students SET name = $1, email = $2, updated_at = NOW()
-       WHERE id = $3
+      `UPDATE students SET ${sets.join(', ')}
+       WHERE id = $${idx}
        RETURNING *`,
-      [name, email, id]
+      values
     );
 
     return sanitizeStudent(result.rows[0]) || null;

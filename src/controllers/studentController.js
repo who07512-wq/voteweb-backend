@@ -142,7 +142,7 @@ class StudentController {
   async update(req, res, next) {
     try {
       const { id } = req.params;
-      const { name, email } = req.body;
+      const { name, email, voting_eligible, role } = req.body;
 
       if (!id || isNaN(parseInt(id))) {
         return res.status(400).json({
@@ -166,15 +166,56 @@ class StudentController {
         });
       }
 
+      if (voting_eligible !== undefined && typeof voting_eligible !== 'boolean') {
+        return res.status(400).json({
+          error: 'Validation Error',
+          message: 'voting_eligible must be a boolean',
+        });
+      }
+
+      const VALID_ROLES = ['STUDENT', 'CANDIDATE', 'CAD', 'ADMIN'];
+      if (role !== undefined && !VALID_ROLES.includes(role)) {
+        return res.status(400).json({
+          error: 'Validation Error',
+          message: `role must be one of: ${VALID_ROLES.join(', ')}`,
+        });
+      }
+
+      // Guard: an admin must never demote themselves (lockout protection)
+      if (role !== undefined && role !== 'ADMIN' && req.user && req.user.studentId === parseInt(id)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'You cannot change your own role.',
+        });
+      }
+
       const student = await studentService.update(parseInt(id), {
         name: name ? name.trim() : null,
         email: email !== undefined ? (email ? email.trim() : null) : undefined,
+        voting_eligible: voting_eligible !== undefined ? voting_eligible : undefined,
+        role: role !== undefined ? role : undefined,
       });
 
       if (!student) {
         return res.status(404).json({
           error: 'Not Found',
           message: `Student with ID ${id} not found`,
+        });
+      }
+
+      // Audit-log every eligibility/role change (never log secrets)
+      if (voting_eligible !== undefined) {
+        await recordAudit('STUDENT_VOTING_ELIGIBILITY_CHANGED', {
+          studentId: parseInt(id),
+          ip: req.ip || null,
+          metadata: { voting_eligible, changedBy: req.user?.email || null },
+        });
+      }
+      if (role !== undefined) {
+        await recordAudit('STUDENT_ROLE_CHANGED', {
+          studentId: parseInt(id),
+          ip: req.ip || null,
+          metadata: { newRole: role, changedBy: req.user?.email || null },
         });
       }
 
