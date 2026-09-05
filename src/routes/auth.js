@@ -206,6 +206,113 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
 });
 
 // =====================================================
+// ADMIN PORTAL LOGIN (fixed email + password, no Clerk/Google)
+//
+// The admin portal (/login/admin) authenticates with a fixed credential
+// instead of Google OAuth. The email must be present in ADMIN_EMAILS and the
+// password must match ADMIN_PORTAL_PASSWORD (set on the server). The account
+// is found or provisioned as ADMIN and a normal backend session is created.
+// =====================================================
+router.post('/admin-portal-login', loginLimiter, csrfProtection, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return authError(res, 400, 'INVALID_INPUT', 'Email is required.');
+    }
+    if (!password || typeof password !== 'string') {
+      return authError(res, 400, 'INVALID_INPUT', 'Password is required.');
+    }
+
+    const adminEmails = String(process.env.ADMIN_EMAILS || '')
+      .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!adminEmails.includes(normalizedEmail)) {
+      await recordAudit('admin_portal_login_denied', {
+        ip: req.ip,
+        metadata: { email: normalizedEmail, reason: 'not_in_admin_list' },
+      });
+      return authError(res, 403, 'NOT_ADMIN', 'This email is not authorized to access the admin portal.');
+    }
+
+    const fixedPassword = process.env.ADMIN_PORTAL_PASSWORD;
+    if (!fixedPassword) {
+      console.error('admin-portal-login: ADMIN_PORTAL_PASSWORD not configured');
+      return authError(res, 500, 'NOT_CONFIGURED', 'Admin portal login is not configured on the server.');
+    }
+
+    const { timingSafeEqual } = require('node:crypto');
+    const given = Buffer.from(String(password));
+    const expected = Buffer.from(fixedPassword);
+    const matches =
+      given.length === expected.length && timingSafeEqual(given, expected);
+
+    if (!matches) {
+      await recordAudit('admin_portal_login_failed', {
+        ip: req.ip,
+        metadata: { email: normalizedEmail, reason: 'invalid_password' },
+      });
+      return authError(res, 401, 'INVALID_CREDENTIALS', 'Incorrect password.');
+    }
+
+    // Find by any login email; provision as ADMIN if it does not exist yet.
+    const account = await db.query(
+      `SELECT * FROM students
+        WHERE LOWER(current_login_email) = LOWER($1)
+           OR LOWER(email) = LOWER($1)
+           OR LOWER(official_email) = LOWER($1)
+        LIMIT 1`,
+      [normalizedEmail]
+    ).then((r) => r.rows[0]);
+
+    let student;
+    if (!account) {
+      const name = normalizedEmail.split('@')[0] || 'Administrator';
+      const usernameBase = normalizedEmail.split('@')[0].replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'admin';
+      const username = `${usernameBase}.${require('node:crypto').randomBytes(3).toString('hex')}`;
+      const randomPassword = require('node:crypto').randomBytes(24).toString('base64url');
+      const passwordHash = await hashPassword(randomPassword);
+      const inserted = await db.query(
+        `INSERT INTO students (external_id, name, email, current_login_email, official_email,
+                              password_hash, role, is_active, username, email_verified)
+         VALUES ($1, $2, $3, $3, $3, $4, 'ADMIN', TRUE, $5, TRUE)
+         RETURNING *`,
+        [`PORTAL-ADMIN-${require('node:crypto').randomBytes(4).toString('hex')}`, name, normalizedEmail, passwordHash, username]
+      ).then((r) => r.rows[0]);
+      student = inserted;
+      console.log('admin-portal-login: provisioned admin', { email: normalizedEmail });
+    } else {
+      // Make sure the listed admin is active and promoted to ADMIN.
+      const updated = await db.query(
+        `UPDATE students SET role = 'ADMIN', is_active = TRUE WHERE id = $1 RETURNING *`,
+        [account.id]
+      ).then((r) => r.rows[0]);
+      student = updated;
+    }
+
+    const bindingToken = await createSession(res, student.id, false);
+
+    await recordAudit('admin_portal_login', {
+      studentId: student.id,
+      ip: req.ip,
+      metadata: { role: 'ADMIN' },
+    });
+
+    return res.json({
+      data: {
+        authenticated: true,
+        bindingToken,
+        user: publicUser(student),
+      },
+    });
+  } catch (error) {
+    console.error('admin-portal-login error:', error);
+    return authError(res, 500, 'INTERNAL_ERROR', 'An error occurred during login.');
+  }
+});
+
+// =====================================================
 // OTP: Send Login OTP
 // =====================================================
 router.post('/otp/send-login', otpLimiter, csrfProtection, async (req, res) => {
