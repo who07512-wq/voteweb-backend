@@ -1699,16 +1699,27 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 // session token as a Bearer token to prove email ownership. We resolve the
 // email server-side, create the account with a real password + roll number,
 // and return a backend session (cv_sid cookie).
+//
+// Roles: STUDENT (default) and CAD. The CAD portal is OPEN (matching the
+// CAD login portal); STUDENT registration is gated by the frontend for now.
+// ADMIN is NEVER created here — admins are provisioned via ADMIN_EMAILS.
 // =====================================================
 router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res) => {
   try {
-    const { password, confirmPassword, rollNumber, fullName } = req.body;
+    const { password, confirmPassword, rollNumber, fullName, role } = req.body;
 
     if (!password || !confirmPassword) {
       return authError(res, 400, 'INVALID_INPUT', 'Password and confirmation are required.');
     }
     if (password !== confirmPassword) {
       return authError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match.');
+    }
+
+    // Role: STUDENT (default) or CAD. Admin is never self-service.
+    const validRoles = ['STUDENT', 'CAD'];
+    const requestedRole = role ? String(role).toUpperCase() : 'STUDENT';
+    if (!validRoles.includes(requestedRole)) {
+      return authError(res, 400, 'INVALID_ROLE', 'Invalid registration role.');
     }
 
     // ---- 1. Prove email ownership via the Clerk session token ----
@@ -1745,8 +1756,13 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
       return authError(res, 400, 'WEAK_PASSWORD', passwordError);
     }
 
+    // Roll number is required for students (identity), optional for CAD
+    // monitors (external collaborators may not have an institute roll no).
     const roll = String(rollNumber || '').trim();
-    if (roll.length < 3 || roll.length > 64) {
+    if (requestedRole === 'STUDENT' && (roll.length < 3 || roll.length > 64)) {
+      return authError(res, 400, 'INVALID_ROLL', 'Please enter a valid roll / enrollment number (3-64 characters).');
+    }
+    if (roll && (roll.length < 3 || roll.length > 64)) {
       return authError(res, 400, 'INVALID_ROLL', 'Please enter a valid roll / enrollment number (3-64 characters).');
     }
 
@@ -1761,36 +1777,43 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
 
     if (existing) {
       // Clerk bridge created a passwordless account earlier — set the
-      // password + roll number and treat this as completion.
+      // password + roll number and treat this as completion. Registering
+      // through the open CAD portal promotes a non-admin account to CAD
+      // (same rule as the CAD login portal); admin is never demoted.
+      const promotedRole =
+        requestedRole === 'CAD' && existing.role === 'STUDENT' ? 'CAD' : existing.role;
       const updated = await db.query(
         `UPDATE students
             SET password_hash = $1,
-                roll_number = COALESCE(roll_number, $2),
+                roll_number = COALESCE(roll_number, NULLIF($2, '')),
                 external_id = CASE WHEN external_id LIKE 'CLERK-%' THEN $3 ELSE external_id END,
+                role = $4,
                 email_verified = TRUE,
                 updated_at = NOW()
-          WHERE id = $4
+          WHERE id = $5
           RETURNING *`,
-        [passwordHash, roll, `REG-${Date.now()}`, existing.id]
+        [passwordHash, roll, `REG-${Date.now()}`, promotedRole, existing.id]
       ).then((r) => r.rows[0]);
       account = updated;
     } else {
       // Duplicate roll number → the roll number IS the student identity.
-      const dupRoll = await db.query(
-        'SELECT id FROM students WHERE LOWER(roll_number) = LOWER($1) LIMIT 1',
-        [roll]
-      ).then((r) => r.rows[0]);
-      if (dupRoll) {
-        return authError(res, 409, 'ROLL_EXISTS',
-          'This roll number is already registered. If it is yours, sign in instead or contact the administrator.');
+      if (roll) {
+        const dupRoll = await db.query(
+          'SELECT id FROM students WHERE LOWER(roll_number) = LOWER($1) LIMIT 1',
+          [roll]
+        ).then((r) => r.rows[0]);
+        if (dupRoll) {
+          return authError(res, 409, 'ROLL_EXISTS',
+            'This roll number is already registered. If it is yours, sign in instead or contact the administrator.');
+        }
       }
 
       const inserted = await db.query(
         `INSERT INTO students (external_id, name, email, current_login_email, password_hash,
                                roll_number, role, is_active, email_verified, username)
-         VALUES ($1, $2, $3, $3, $4, $5, 'STUDENT', TRUE, TRUE, $6)
+         VALUES ($1, $2, $3, $3, $4, NULLIF($5, ''), $6, TRUE, TRUE, $7)
          RETURNING *`,
-        [`REG-${Date.now()}`, name, email, passwordHash, roll, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
+        [`REG-${Date.now()}`, name, email, passwordHash, roll, requestedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
       ).then((r) => r.rows[0]);
       account = inserted;
     }
