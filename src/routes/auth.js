@@ -1700,9 +1700,11 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 // email server-side, create the account with a real password + roll number,
 // and return a backend session (cv_sid cookie).
 //
-// Roles: STUDENT (default) and CAD. The CAD portal is OPEN (matching the
-// CAD login portal); STUDENT registration is gated by the frontend for now.
-// ADMIN is NEVER created here — admins are provisioned via ADMIN_EMAILS.
+// Roles: registration creates a STUDENT account used to apply as a
+// candidate (CANDIDATE is earned when an admin approves the application).
+// STUDENT-portal registration is gated by the frontend for now; only the
+// candidate registration is open. ADMIN is NEVER created here — admins are
+// provisioned via ADMIN_EMAILS.
 // =====================================================
 router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res) => {
   try {
@@ -1715,12 +1717,16 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
       return authError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match.');
     }
 
-    // Role: STUDENT (default) or CAD. Admin is never self-service.
-    const validRoles = ['STUDENT', 'CAD'];
+    // Role: STUDENT (default) or CANDIDATE (registers a student account for
+    // the candidate application flow). CAD is no longer registrable and
+    // ADMIN is never self-service.
+    const validRoles = ['STUDENT', 'CANDIDATE'];
     const requestedRole = role ? String(role).toUpperCase() : 'STUDENT';
     if (!validRoles.includes(requestedRole)) {
       return authError(res, 400, 'INVALID_ROLE', 'Invalid registration role.');
     }
+    // Candidacy is earned via application approval, never granted at signup.
+    const storedRole = 'STUDENT';
 
     // ---- 1. Prove email ownership via the Clerk session token ----
     let verified;
@@ -1756,13 +1762,14 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
       return authError(res, 400, 'WEAK_PASSWORD', passwordError);
     }
 
-    // Roll number is required for students (identity), optional for CAD
-    // monitors (external collaborators may not have an institute roll no).
+    // Roll number is required for direct student registration, optional when
+    // registering through the candidate portal (the application form collects
+    // the enrollment number anyway).
     const roll = String(rollNumber || '').trim();
-    if (requestedRole === 'STUDENT' && (roll.length < 3 || roll.length > 64)) {
+    if (roll && (roll.length < 3 || roll.length > 64)) {
       return authError(res, 400, 'INVALID_ROLL', 'Please enter a valid roll / enrollment number (3-64 characters).');
     }
-    if (roll && (roll.length < 3 || roll.length > 64)) {
+    if (!roll && requestedRole === 'STUDENT') {
       return authError(res, 400, 'INVALID_ROLL', 'Please enter a valid roll / enrollment number (3-64 characters).');
     }
 
@@ -1777,11 +1784,8 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
 
     if (existing) {
       // Clerk bridge created a passwordless account earlier — set the
-      // password + roll number and treat this as completion. Registering
-      // through the open CAD portal promotes a non-admin account to CAD
-      // (same rule as the CAD login portal); admin is never demoted.
-      const promotedRole =
-        requestedRole === 'CAD' && existing.role === 'STUDENT' ? 'CAD' : existing.role;
+      // password + roll number and treat this as completion. Roles are never
+      // changed here (candidacy is earned via application approval).
       const updated = await db.query(
         `UPDATE students
             SET password_hash = $1,
@@ -1792,7 +1796,7 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
                 updated_at = NOW()
           WHERE id = $5
           RETURNING *`,
-        [passwordHash, roll, `REG-${Date.now()}`, promotedRole, existing.id]
+        [passwordHash, roll, `REG-${Date.now()}`, existing.role, existing.id]
       ).then((r) => r.rows[0]);
       account = updated;
     } else {
@@ -1813,7 +1817,7 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
                                roll_number, role, is_active, email_verified, username)
          VALUES ($1, $2, $3, $3, $4, NULLIF($5, ''), $6, TRUE, TRUE, $7)
          RETURNING *`,
-        [`REG-${Date.now()}`, name, email, passwordHash, roll, requestedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
+        [`REG-${Date.now()}`, name, email, passwordHash, roll, storedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
       ).then((r) => r.rows[0]);
       account = inserted;
     }
