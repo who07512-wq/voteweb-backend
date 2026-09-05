@@ -1773,10 +1773,13 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
       return authError(res, 400, 'INVALID_ROLL', 'Please enter a valid roll / enrollment number (3-64 characters).');
     }
 
-    const name = String(fullName || '').trim() || identifier;
-    if (name.length > 255) {
-      return authError(res, 400, 'INVALID_NAME', 'Name is too long.');
+    const name = String(fullName || '').trim();
+    if (!name || name.length < 2 || name.length > 255) {
+      return authError(res, 400, 'INVALID_NAME', 'Please enter your full name (2-255 characters).');
     }
+    // Registration name IS the account name — it pre-fills the candidate
+    // application form and shows on dashboards/profile.
+    void identifier;
 
     // ---- 4. Create (or upgrade) the account ----
     const passwordHash = await hashPassword(password);
