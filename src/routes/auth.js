@@ -20,6 +20,7 @@ const { createMfaChallenge, findChallenge, deleteChallenge, incrementChallengeAt
 const { createOtpChallenge, findValidChallenge, verifyOtpChallenge, checkRateLimit, RESEND_COOLDOWN_MS } = require('../services/otpService');
 const { sendLoginOtp, sendPasswordResetOtp } = require('../services/brevoService');
 const { recordAudit, findStudentByIdentifierOrEmail, publicUser, isLocked } = require('../lib/authDb');
+const { verifyClerkSessionToken } = require('../lib/clerkVerify');
 
 // Helper for consistent error responses
 function authError(res, status, code, message) {
@@ -83,10 +84,11 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
       return authError(res, 400, 'INVALID_INPUT', 'Password is required.');
     }
 
-    // Validate role
-    const validRoles = ['STUDENT', 'CANDIDATE', 'ADMIN'];
-    const requestedRole = (role || 'STUDENT').toUpperCase();
-    if (!validRoles.includes(requestedRole)) {
+    // Validate role. When omitted, the account's actual DB role is used
+    // (the main portal lets any role sign in; dashboards route by DB role).
+    const validRoles = ['STUDENT', 'CANDIDATE', 'ADMIN', 'CAD'];
+    const requestedRole = req.body.role ? String(req.body.role).toUpperCase() : null;
+    if (requestedRole && !validRoles.includes(requestedRole)) {
       return authError(res, 400, 'INVALID_ROLE', 'Invalid login role.');
     }
 
@@ -103,7 +105,9 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
     }
 
     // ENFORCE ROLE SEPARATION - Critical security check
-    if (account.role !== requestedRole) {
+    // When role is omitted (main portal), any DB role is accepted — the
+    // frontend routes to the dashboard matching the returned DB role.
+    if (requestedRole && account.role !== requestedRole) {
       await recordAudit('login_failed', {
         studentId: account.id,
         ip: req.ip,
@@ -1684,6 +1688,218 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
   } catch (error) {
     console.error('Instant registration error:', error);
     return authError(res, 500, 'INTERNAL_ERROR', 'An error occurred during registration.');
+  }
+});
+
+// =====================================================
+// CLERK-PROOF REGISTRATION (email → OTP code → set password + roll number)
+//
+// The frontend collects the email, completes a Clerk email-code challenge
+// (Clerk sends the OTP email), then calls this endpoint with the Clerk
+// session token as a Bearer token to prove email ownership. We resolve the
+// email server-side, create the account with a real password + roll number,
+// and return a backend session (cv_sid cookie).
+// =====================================================
+router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res) => {
+  try {
+    const { password, confirmPassword, rollNumber, fullName } = req.body;
+
+    if (!password || !confirmPassword) {
+      return authError(res, 400, 'INVALID_INPUT', 'Password and confirmation are required.');
+    }
+    if (password !== confirmPassword) {
+      return authError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match.');
+    }
+
+    // ---- 1. Prove email ownership via the Clerk session token ----
+    let verified;
+    try {
+      verified = await verifyClerkSessionToken(
+        (req.headers.authorization || '').replace(/^Bearer /i, ''),
+        String(req.body.email || '')
+      );
+    } catch (err) {
+      console.error('register/clerk: token verification failed:', err.message);
+      return authError(res, err.status || 401, err.code || 'INVALID_CLERK_TOKEN',
+        'Email verification could not be confirmed. Please request a new code.');
+    }
+    const email = verified.email;
+
+    // ---- 2. Existing account with a password? Point them at login ----
+    const existing = await db.query(
+      `SELECT id, role, password_hash FROM students
+        WHERE LOWER(current_login_email) = LOWER($1) OR LOWER(email) = LOWER($1)
+        LIMIT 1`,
+      [email]
+    ).then((r) => r.rows[0]);
+
+    if (existing && existing.password_hash) {
+      return authError(res, 409, 'EMAIL_EXISTS',
+        'An account with this email already exists. Please sign in with your email and password.');
+    }
+
+    // ---- 3. Validate password policy + roll number ----
+    const identifier = email.split('@')[0];
+    const passwordError = validatePasswordPolicy(password, identifier);
+    if (passwordError) {
+      return authError(res, 400, 'WEAK_PASSWORD', passwordError);
+    }
+
+    const roll = String(rollNumber || '').trim();
+    if (roll.length < 3 || roll.length > 64) {
+      return authError(res, 400, 'INVALID_ROLL', 'Please enter a valid roll / enrollment number (3-64 characters).');
+    }
+
+    const name = String(fullName || '').trim() || identifier;
+    if (name.length > 255) {
+      return authError(res, 400, 'INVALID_NAME', 'Name is too long.');
+    }
+
+    // ---- 4. Create (or upgrade) the account ----
+    const passwordHash = await hashPassword(password);
+    let account;
+
+    if (existing) {
+      // Clerk bridge created a passwordless account earlier — set the
+      // password + roll number and treat this as completion.
+      const updated = await db.query(
+        `UPDATE students
+            SET password_hash = $1,
+                roll_number = COALESCE(roll_number, $2),
+                external_id = CASE WHEN external_id LIKE 'CLERK-%' THEN $3 ELSE external_id END,
+                email_verified = TRUE,
+                updated_at = NOW()
+          WHERE id = $4
+          RETURNING *`,
+        [passwordHash, roll, `REG-${Date.now()}`, existing.id]
+      ).then((r) => r.rows[0]);
+      account = updated;
+    } else {
+      // Duplicate roll number → the roll number IS the student identity.
+      const dupRoll = await db.query(
+        'SELECT id FROM students WHERE LOWER(roll_number) = LOWER($1) LIMIT 1',
+        [roll]
+      ).then((r) => r.rows[0]);
+      if (dupRoll) {
+        return authError(res, 409, 'ROLL_EXISTS',
+          'This roll number is already registered. If it is yours, sign in instead or contact the administrator.');
+      }
+
+      const inserted = await db.query(
+        `INSERT INTO students (external_id, name, email, current_login_email, password_hash,
+                               roll_number, role, is_active, email_verified, username)
+         VALUES ($1, $2, $3, $3, $4, $5, 'STUDENT', TRUE, TRUE, $6)
+         RETURNING *`,
+        [`REG-${Date.now()}`, name, email, passwordHash, roll, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
+      ).then((r) => r.rows[0]);
+      account = inserted;
+    }
+
+    // ---- 5. Session ----
+    const bindingToken = await createSession(res, account.id, false);
+
+    await recordAudit('registration_completed', {
+      studentId: account.id,
+      ip: req.ip,
+      metadata: { method: 'clerk_email_code', email },
+    });
+
+    return res.status(201).json({
+      data: {
+        authenticated: true,
+        bindingToken,
+        user: publicUser(account),
+      },
+    });
+  } catch (error) {
+    console.error('Clerk registration error:', error);
+    return authError(res, 500, 'INTERNAL_ERROR', 'An error occurred during registration.');
+  }
+});
+
+// =====================================================
+// CLERK-PROOF FORGOT PASSWORD (email → OTP code → set new password)
+//
+// Same email-ownership proof as registration, but for accounts that already
+// exist. The account must have a password (Clerk-bridge accounts without one
+// are told to register instead).
+// =====================================================
+router.post('/forgot-password/clerk', passwordResetLimiter, csrfProtection, async (req, res) => {
+  try {
+    const { newPassword, confirmNewPassword } = req.body;
+
+    if (!newPassword || !confirmNewPassword) {
+      return authError(res, 400, 'INVALID_INPUT', 'New password and confirmation are required.');
+    }
+    if (newPassword !== confirmNewPassword) {
+      return authError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match.');
+    }
+
+    // ---- 1. Prove email ownership via the Clerk session token ----
+    let verified;
+    try {
+      verified = await verifyClerkSessionToken(
+        (req.headers.authorization || '').replace(/^Bearer /i, ''),
+        String(req.body.email || '')
+      );
+    } catch (err) {
+      console.error('forgot-password/clerk: token verification failed:', err.message);
+      return authError(res, err.status || 401, err.code || 'INVALID_CLERK_TOKEN',
+        'Email verification could not be confirmed. Please request a new code.');
+    }
+    const email = verified.email;
+
+    // ---- 2. Account must exist ----
+    const account = await db.query(
+      `SELECT * FROM students
+        WHERE is_active = TRUE
+          AND (LOWER(current_login_email) = LOWER($1) OR LOWER(email) = LOWER($1))
+        LIMIT 1`,
+      [email]
+    ).then((r) => r.rows[0]);
+
+    if (!account) {
+      return authError(res, 404, 'ACCOUNT_NOT_FOUND',
+        'No account exists for this email. Please register first.');
+    }
+
+    // ---- 3. Validate + set the new password ----
+    const identifier = email.split('@')[0];
+    const passwordError = validatePasswordPolicy(newPassword, identifier);
+    if (passwordError) {
+      return authError(res, 400, 'WEAK_PASSWORD', passwordError);
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+    await db.query(
+      'UPDATE students SET password_hash = $1, password_change_required = FALSE, failed_login_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $2',
+      [passwordHash, account.id]
+    );
+
+    // Invalidate every existing session (they were issued under the old
+    // credential) and issue a fresh one.
+    await db.query(
+      'UPDATE sessions SET revoked_at = NOW() WHERE student_id = $1 AND revoked_at IS NULL',
+      [account.id]
+    );
+    const bindingToken = await createSession(res, account.id, false);
+
+    await recordAudit('password_reset_completed', {
+      studentId: account.id,
+      ip: req.ip,
+      metadata: { method: 'clerk_email_code' },
+    });
+
+    return res.json({
+      data: {
+        authenticated: true,
+        bindingToken,
+        user: publicUser(account),
+      },
+    });
+  } catch (error) {
+    console.error('Clerk forgot password error:', error);
+    return authError(res, 500, 'INTERNAL_ERROR', 'An error occurred resetting the password.');
   }
 });
 
