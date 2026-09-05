@@ -156,11 +156,13 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       const isInvitedAdmin = adminList.includes(email);
 
       // Invited admins are created straight as ADMIN.
+      // The CAD portal is OPEN: anyone who signs in through it is granted
+      // CAD. Only ADMIN stays whitelisted (ADMIN_EMAILS).
       // CANDIDATE is NEVER granted at signup — it is earned when an admin
       // approves the candidate application (candidateApplicationService.approve).
       const roleToUse = isInvitedAdmin
         ? 'ADMIN'
-        : requestedRoleRaw === 'CAD' && cadList.includes(email)
+        : requestedRoleRaw === 'CAD'
           ? 'CAD'
           : 'STUDENT';
 
@@ -181,14 +183,15 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       ).then((r) => r.rows[0]);
       account.role = promoted.role;
       console.log('clerk-session: bootstrapped admin', { email });
-    } else if (cadList.includes(email) && account.role !== 'CAD' && account.role !== 'ADMIN') {
-      // Bootstrap: promote listed CAD emails at sign-in (only if not ADMIN)
+    } else if (requestedRoleRaw === 'CAD' && account.role !== 'CAD' && account.role !== 'ADMIN') {
+      // CAD portal is OPEN — promote any non-admin account that signs in
+      // through it to CAD. ADMIN is never demoted.
       const promoted = await db.query(
         `UPDATE students SET role = 'CAD' WHERE id = $1 RETURNING role`,
         [account.id]
       ).then((r) => r.rows[0]);
       account.role = promoted.role;
-      console.log('clerk-session: bootstrapped CAD', { email });
+      console.log('clerk-session: granted CAD', { email });
     }
 
     // ---- 5. Create backend session (cv_sid cookie set here) ----
