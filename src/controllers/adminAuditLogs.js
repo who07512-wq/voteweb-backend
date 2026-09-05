@@ -24,10 +24,10 @@ async function list(req, res) {
         `SELECT a.id, NULL::int AS student_id, a.event_type AS action, a.ip_address,
                  jsonb_build_object('entityType', a.entity_type, 'entityId', a.entity_id, 'name', (a.details->>'name')) AS metadata,
                  a.created_at,
-                 a.admin_user_id AS student_id_ref,
+                 a.actor_id AS student_id_ref,
                  s.name AS user_name, s.role AS user_role
             FROM audit_logs a
-            LEFT JOIN students s ON s.id = a.admin_user_id
+            LEFT JOIN students s ON s.id = a.actor_id
            ORDER BY a.created_at DESC
            LIMIT $1`,
         [limit]
