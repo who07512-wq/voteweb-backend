@@ -163,6 +163,9 @@ app.get('/api/health/brevo', (req, res) => {
 // Debug: Check OTP challenge for email (dev only)
 const db = require('./db');
 app.get('/api/debug/otp/:email', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Not available in production' });
+  }
   const { email } = req.params;
   const challenges = await db.query(
     `SELECT id, email, purpose, target_role, used, attempts, expires_at, created_at
@@ -177,6 +180,9 @@ app.get('/api/debug/otp/:email', async (req, res) => {
 
 // Debug: Check sessions for student
 app.get('/api/debug/sessions/:studentId', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Not available in production' });
+  }
   const { studentId } = req.params;
   const sessions = await db.query(
     `SELECT id, student_id, session_hash, expires_at, revoked_at, created_at
@@ -191,6 +197,9 @@ app.get('/api/debug/sessions/:studentId', async (req, res) => {
 
 // Debug: Check session by session hash
 app.get('/api/debug/session-lookup', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Not available in production' });
+  }
   const sessionId = req.cookies?.cv_sid || req.query.sid;
   if (!sessionId) {
     return res.json({ error: 'No session cookie' });
