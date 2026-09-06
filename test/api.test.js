@@ -16,6 +16,7 @@ const app = require('../src/app');
 const db = require('../src/db');
 const { hashPassword } = require('../src/lib/password');
 const { TestClient, randomId } = require('./helpers');
+const { setupTestDatabase } = require('./setup');
 
 let server;
 let baseUrl;
@@ -35,6 +36,11 @@ test.before(async () => {
   const externalId = `TST${randomId('')}`.slice(0, 18);
   const attackerExternalId = `ATK${randomId('')}`.slice(0, 18);
   const hash = await hashPassword(TEST_PW);
+
+  // Deterministic fixtures: STU001 (STUDENT) + ADMIN001 (ADMIN) + the base
+  // election structure the tests reference. The suite never depends on dev
+  // seed.js output.
+  await setupTestDatabase(db);
 
   const inserted = await db.query(
     `INSERT INTO students (external_id, name, email, role, password_hash, password_change_required)
@@ -67,6 +73,11 @@ test.after(async () => {
   await db.query('DELETE FROM votes WHERE student_id = $1', [testStudentId]);
   await db.query('DELETE FROM votes WHERE student_id = $1', [attackerStudentId]);
   await db.query('DELETE FROM students WHERE id IN ($1, $2)', [testStudentId, attackerStudentId]);
+  // Clean up the deterministic auth fixtures.
+  await db.query("DELETE FROM notifications WHERE user_id IN ((SELECT id FROM students WHERE external_id = 'STU001'), (SELECT id FROM students WHERE external_id = 'ADMIN001'))");
+  await db.query("DELETE FROM sessions WHERE student_id IN ((SELECT id FROM students WHERE external_id = 'STU001'), (SELECT id FROM students WHERE external_id = 'ADMIN001'))");
+  await db.query("DELETE FROM mfa_challenges WHERE student_id IN ((SELECT id FROM students WHERE external_id = 'STU001'), (SELECT id FROM students WHERE external_id = 'ADMIN001'))");
+  await db.query("DELETE FROM students WHERE external_id IN ('STU001', 'ADMIN001')");
   server.close();
   await db.close();
   delete globalThis.__TEST_STUDENT_ID__;

@@ -24,14 +24,22 @@ class ElectionService {
    * Find all elections
    */
   async findAll(options = {}) {
-    const { status, limit = 100, offset = 0 } = options;
+    const { status, limit = 100, offset = 0, excludeDraft = false } = options;
 
     let query = 'SELECT * FROM elections';
     const params = [];
+    const where = [];
 
     if (status) {
-      query += ' WHERE status = $1';
+      where.push('status = $' + (params.length + 1));
       params.push(status);
+    } else if (excludeDraft) {
+      // Non-staff viewers only see real elections, never internal drafts.
+      where.push("status <> 'DRAFT'");
+    }
+
+    if (where.length) {
+      query += ' WHERE ' + where.join(' AND ');
     }
 
     query += ' ORDER BY id LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);

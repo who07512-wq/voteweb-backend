@@ -19,7 +19,7 @@ const { createSession, revokeSession, rotateSession } = require('../services/ses
 const { createMfaChallenge, findChallenge, deleteChallenge, incrementChallengeAttempts } = require('../services/mfaService');
 const { createOtpChallenge, findValidChallenge, verifyOtpChallenge, checkRateLimit, RESEND_COOLDOWN_MS } = require('../services/otpService');
 const { sendLoginOtp, sendPasswordResetOtp } = require('../services/brevoService');
-const { recordAudit, findStudentByIdentifierOrEmail, publicUser, isLocked } = require('../lib/authDb');
+const { recordAudit, findStudentByIdentifierOrEmail, publicUser, isLocked, incrementFailedLogin, updateStudentLogin } = require('../lib/authDb');
 const { verifyClerkSessionToken } = require('../lib/clerkVerify');
 
 // Helper for consistent error responses
@@ -40,16 +40,12 @@ router.get('/csrf', (req, res) => {
 });
 
 // =====================================================
-// DEBUG: Check Brevo email status
+// DEBUG: Check Brevo email status (booleans only — never expose the API key
+// prefix or sender address to unauthenticated callers).
 // =====================================================
 router.get('/debug/brevo-status', (req, res) => {
-  const apiKey = process.env.BREVO_API_KEY;
   res.json({
-    configured: !!apiKey,
-    apiKeyPrefix: apiKey ? apiKey.substring(0, 8) + '...' : null,
-    senderEmail: process.env.BREVO_SENDER_EMAIL,
-    senderName: process.env.BREVO_SENDER_NAME,
-    nodeEnv: process.env.NODE_ENV,
+    configured: !!process.env.BREVO_API_KEY,
   });
 });
 
@@ -130,11 +126,10 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
     // Verify password
     const valid = await verifyPassword(password, account.password_hash);
     if (!valid) {
-      // Increment failed attempts
-      await db.query(
-        'UPDATE students SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1',
-        [account.id]
-      );
+      // Increment failed attempts and auto-lock at threshold. Uses the
+      // shared helper so locked_until is set (the old raw UPDATE only bumped
+      // the counter and never locked the account).
+      await incrementFailedLogin(account);
 
       await recordAudit('login_failed', {
         studentId: account.id,
@@ -146,10 +141,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
     }
 
     // Reset failed attempts on successful password verification
-    await db.query(
-      'UPDATE students SET failed_login_attempts = 0, last_login_at = NOW() WHERE id = $1',
-      [account.id]
-    );
+    await updateStudentLogin(account.id);
 
     // ADMIN accounts require MFA
     if (account.role === 'ADMIN') {
@@ -718,47 +710,46 @@ router.post('/otp/verify-reset', passwordResetLimiter, csrfProtection, async (re
       return authError(res, 400, 'INVALID_ROLE', 'Invalid role.');
     }
 
-    // Find and verify the challenge
-    const result = await verifyOtpChallenge(challengeId, otp, 'PASSWORD_RESET', requestedRole);
+    // Find and verify the challenge. Signature: verifyOtpChallenge(email, purpose, otp, targetRole).
+    // Returns { success:boolean, error:string|null, challenge:object|null }.
+    const result = await verifyOtpChallenge(email, 'PASSWORD_RESET', otp, requestedRole);
 
-    if (result.error) {
+    if (!result.success || !result.challenge) {
       if (result.error === 'EXPIRED') {
         return authError(res, 400, 'OTP_EXPIRED', 'Reset code has expired. Please request a new one.');
       }
       if (result.error === 'MAX_ATTEMPTS') {
         return authError(res, 400, 'MAX_ATTEMPTS', 'Too many attempts. Please request a new code.');
       }
-      if (result.error === 'INVALID') {
+      if (result.error === 'INVALID_OTP') {
         return authError(res, 400, 'INVALID_OTP', 'Invalid reset code.');
-      }
-      if (result.error === 'ALREADY_USED') {
-        return authError(res, 400, 'OTP_USED', 'This code has already been used.');
       }
       return authError(res, 400, 'INVALID_OTP', 'Invalid reset code.');
     }
 
-    const { studentId } = result;
-
-    // Get the account to verify role
+    // The challenge carries the email + role, but no student_id — derive the
+    // student account from the verified email.
     const account = await db.query(
-      'SELECT id, role FROM students WHERE id = $1 AND is_active = TRUE',
-      [studentId]
+      `SELECT id, role FROM students
+        WHERE is_active = TRUE
+          AND (LOWER(current_login_email) = LOWER($1)
+               OR LOWER(email) = LOWER($1)
+               OR LOWER(official_email) = LOWER($1))
+        LIMIT 1`,
+      [email]
     ).then(r => r.rows[0]);
 
     if (!account) {
       return authError(res, 400, 'ACCOUNT_NOT_FOUND', 'Account not found.');
     }
 
-    // Verify role matches
+    // Verify role matches the one the OTP was issued for.
     if (account.role !== requestedRole) {
       return authError(res, 400, 'INVALID_REQUEST', 'Reset code does not match the selected role.');
     }
 
-    // Generate a temporary reset token
-    const resetToken = require('node:crypto').randomBytes(32).toString('base64url');
-
-    // Store the reset token (simplified - in production, store in DB with expiration)
-    // For now, we return success and the frontend uses the challengeId to complete reset
+    const studentId = account.id;
+    const challengeId = result.challenge.id;
 
     await recordAudit('password_reset_verified', {
       studentId,
@@ -804,11 +795,11 @@ router.post('/reset-password', passwordResetLimiter, csrfProtection, async (req,
       return authError(res, 400, 'INVALID_ROLE', 'Invalid role.');
     }
 
-    // Find the challenge
+    // Find the challenge (otp_challenges has email + target_role, no
+    // student_id, so the account is derived from the challenge email + role).
     const challenge = await db.query(
-      `SELECT c.*, s.id as student_id, s.role, s.password_hash
+      `SELECT c.*
        FROM otp_challenges c
-       JOIN students s ON s.id = c.student_id
        WHERE c.id = $1 AND c.purpose = 'PASSWORD_RESET' AND c.used = FALSE AND c.expires_at > NOW()`,
       [challengeId]
     ).then(r => r.rows[0]);
@@ -817,8 +808,23 @@ router.post('/reset-password', passwordResetLimiter, csrfProtection, async (req,
       return authError(res, 400, 'INVALID_CHALLENGE', 'Reset request not found or expired.');
     }
 
-    // Verify role
-    if (challenge.role !== requestedRole) {
+    // Derive the student account from the verified challenge email.
+    const account = await db.query(
+      `SELECT id, role FROM students
+        WHERE is_active = TRUE
+          AND (LOWER(current_login_email) = LOWER($1)
+               OR LOWER(email) = LOWER($1)
+               OR LOWER(official_email) = LOWER($1))
+        LIMIT 1`,
+      [challenge.email]
+    ).then(r => r.rows[0]);
+
+    if (!account) {
+      return authError(res, 400, 'ACCOUNT_NOT_FOUND', 'Account not found.');
+    }
+
+    // Verify role chosen for the reset matches the account's actual role.
+    if (account.role !== requestedRole) {
       return authError(res, 400, 'INVALID_ROLE', 'Reset request does not match selected role.');
     }
 
@@ -836,7 +842,7 @@ router.post('/reset-password', passwordResetLimiter, csrfProtection, async (req,
     try {
       await db.query(
         'UPDATE students SET password_hash = $1, failed_login_attempts = 0 WHERE id = $2',
-        [passwordHash, challenge.student_id]
+        [passwordHash, account.id]
       );
       await db.query(
         'UPDATE otp_challenges SET used = TRUE, consumed_at = NOW() WHERE id = $1',
@@ -851,11 +857,11 @@ router.post('/reset-password', passwordResetLimiter, csrfProtection, async (req,
     // Revoke all existing sessions for this user
     await db.query(
       'UPDATE sessions SET revoked_at = NOW() WHERE student_id = $1 AND revoked_at IS NULL',
-      [challenge.student_id]
+      [account.id]
     );
 
     await recordAudit('password_reset_completed', {
-      studentId: challenge.student_id,
+      studentId: account.id,
       ip: req.ip,
     });
 
@@ -1203,8 +1209,8 @@ router.post('/mfa/verify', mfaLimiter, csrfProtection, async (req, res) => {
       return authError(res, 429, 'MAX_ATTEMPTS', 'Too many attempts. Please start over.');
     }
 
-    // Verify TOTP
-    const isValid = await verifyTotp(code, decryptSecret(challengeData.mfa_secret_encrypted));
+    // Verify TOTP (signature: verifyTotp(secret, code, timestamp))
+    const isValid = await verifyTotp(decryptSecret(challengeData.mfa_secret_encrypted), code);
 
     if (!isValid) {
       await incrementChallengeAttempts(challengeData.id);
@@ -1262,8 +1268,10 @@ router.post('/mfa/setup', mfaLimiter, csrfProtection, async (req, res) => {
       return authError(res, 400, 'MFA_ALREADY_ENABLED', 'MFA is already enabled.');
     }
 
-    // Generate new TOTP secret
-    const { secret, uri } = await generateTotpSecret(account.email);
+    // Generate new TOTP secret. generateTotpSecret() returns a base32 string;
+    // provisioningUri(secret, identifier) builds the otpauth:// URI for the QR.
+    const secret = generateTotpSecret();
+    const uri = provisioningUri(secret, account.email);
 
     // Encrypt and store the secret
     const encryptedSecret = encryptSecret(secret);
@@ -1342,9 +1350,9 @@ router.post('/mfa/verify-setup', mfaLimiter, csrfProtection, async (req, res) =>
       return authError(res, 400, 'MFA_NOT_SETUP', 'Please start MFA setup first.');
     }
 
-    // Verify the code
+    // Verify the code (signature: verifyTotp(secret, code, timestamp))
     const secret = decryptSecret(account.mfa_secret_encrypted);
-    const isValid = await verifyTotp(code, secret);
+    const isValid = await verifyTotp(secret, code);
 
     if (!isValid) {
       return authError(res, 400, 'INVALID_CODE', 'Invalid verification code.');

@@ -27,10 +27,20 @@ class ElectionController {
       const MAX_LIMIT = 100;
       const parsedLimit = Math.min(parseInt(limit) || 100, MAX_LIMIT);
 
+      // Non-admin viewers must NEVER see DRAFT elections (drafts are internal
+      // working state; exposing them leaks upcoming/abandoned ballots). The
+      // role is read from the server-side session, never the client.
+      const viewerRole = (req.user?.role || '').toUpperCase();
+      const isStaff = viewerRole === 'ADMIN' || viewerRole === 'CAD';
+      const effectiveStatus = status
+        ? status
+        : null;
+
       const elections = await electionService.findAll({
         status: status || null,
         limit: parsedLimit,
         offset: parseInt(offset) || 0,
+        excludeDraft: !isStaff,
       });
 
       res.json({

@@ -25,7 +25,7 @@ async function getStats(req, res) {
                        COUNT(*) FILTER (WHERE status = 'pending')::int AS pending
                   FROM student_access_requests`),
       db.query(`SELECT COUNT(*)::int AS total
-                  FROM candidate_applications WHERE status = 'pending'`),
+                  FROM candidate_applications WHERE status = 'under_review'`),
     ]);
 
     return res.json({

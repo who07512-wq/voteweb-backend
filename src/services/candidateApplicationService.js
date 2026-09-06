@@ -4,6 +4,7 @@
  */
 
 const db = require('../db');
+const candidateService = require('./candidateService');
 
 class CandidateApplicationService {
   /**
@@ -256,6 +257,32 @@ class CandidateApplicationService {
       );
     }
 
+    // Also create a ballot row in `candidates` so the approved applicant
+    // actually appears on the ballot. Only possible when a position_id was
+    // supplied (position_id is optional on the application). Dell: if no
+    // position, the candidate cannot be on a ballot; skip silently.
+    if (result.rows[0].position_id) {
+      try {
+        await candidateService.create({
+          position_id: result.rows[0].position_id,
+          name: result.rows[0].full_name,
+          description: result.rows[0].bio || result.rows[0].manifesto || null,
+          image_url: result.rows[0].profile_photo_url || null,
+        });
+      } catch (err) {
+        // Duplicate name within the same position OR position no longer valid.
+        // Do not fail the approval: the application is still valid, the ballot
+        // row is best-effort. Log and continue.
+        if (err.code !== '23505' && err.code !== '23503') {
+          throw err;
+        }
+        console.warn(
+          'approve: could not create candidates ballot row',
+          { applicationId: id, positionId: result.rows[0].position_id, code: err.code }
+        );
+      }
+    }
+
     return this.formatApplication(result.rows[0]);
   }
 
@@ -299,6 +326,17 @@ class CandidateApplicationService {
         `UPDATE students SET role = 'STUDENT', updated_at = NOW()
          WHERE id = $1 AND role = 'CANDIDATE'`,
         [appId]
+      );
+    }
+
+    // Remove the ballot row this applicant may have earned when they were
+    // approved, so a reversed approval does not leave them contesting on the
+    // ballot. Scoped by position (required) and name (the person).
+    if (result.rows[0].position_id && result.rows[0].full_name) {
+      await db.query(
+        `DELETE FROM candidates
+         WHERE position_id = $1 AND name = $2`,
+        [result.rows[0].position_id, result.rows[0].full_name]
       );
     }
 

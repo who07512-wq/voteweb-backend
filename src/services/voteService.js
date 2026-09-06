@@ -357,7 +357,7 @@ class VoteService {
         cl.name as club_name,
         p.id as position_id,
         p.name as position_name,
-        p.max_selections,
+        COALESCE(p.max_selections, 1) as max_selections,
         c.id as candidate_id,
         c.name as candidate_name,
         COUNT(v.id) as vote_count
@@ -366,7 +366,7 @@ class VoteService {
        JOIN positions p ON v.position_id = p.id
        JOIN clubs cl ON p.club_id = cl.id
        WHERE v.election_id = $1
-       GROUP BY cl.id, cl.name, p.id, p.name, p.max_selections, p.display_order, c.id, c.name, c.display_order
+       GROUP BY cl.id, cl.name, p.id, p.name, COALESCE(p.max_selections, 1), p.display_order, c.id, c.name, c.display_order
        ORDER BY cl.name, p.display_order, c.display_order, vote_count DESC`,
       [electionId]
     );
@@ -393,7 +393,7 @@ class VoteService {
         clubs[row.club_id].positions[row.position_id] = {
           position_id: row.position_id,
           position_name: row.position_name,
-          max_selections: row.max_selections,
+          max_selections: row.max_selections || 1,
           candidates: [],
           total_votes: 0,
         };

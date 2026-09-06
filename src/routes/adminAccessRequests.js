@@ -14,6 +14,7 @@ const express = require('express');
 const router = express.Router();
 
 const service = require('../services/accessRequestService');
+const { csrfProtection } = require('../middleware/csrfProtection');
 
 // ---- GET / ----
 router.get('/', async (req, res) => {
@@ -48,7 +49,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // ---- PATCH /:id/approve ----
-router.patch('/:id/approve', async (req, res) => {
+router.patch('/:id/approve', csrfProtection, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) {
@@ -78,7 +79,7 @@ router.patch('/:id/approve', async (req, res) => {
 });
 
 // ---- PATCH /:id/reject ----
-router.patch('/:id/reject', async (req, res) => {
+router.patch('/:id/reject', csrfProtection, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) {

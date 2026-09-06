@@ -114,8 +114,18 @@ async function verifyClerkSessionToken(token, clientEmail) {
   }
 
   const secretKey = process.env.CLERK_SECRET_KEY;
+  // CRITICAL: the resolved email is used to find the account (register /
+  // password reset). It MUST come from the Clerk Backend API, not the client,
+  // or the "email" is attacker-controlled → account takeover. Fail closed when
+  // CLERK_SECRET_KEY is absent rather than trusting clientEmail.
   const serverEmail = secretKey ? await fetchClerkPrimaryEmail(secretKey, clerkUserId) : null;
-  const email = (serverEmail || String(clientEmail || '')).toLowerCase().trim();
+  if (!serverEmail) {
+    const err = new Error('Could not verify your email. Please ensure the Clerk backend is configured.');
+    err.code = 'CLERK_EMAIL_UNVERIFIED';
+    err.status = 401;
+    throw err;
+  }
+  const email = serverEmail;
   if (!email || !email.includes('@')) {
     const err = new Error('The verified account has no usable email address.');
     err.code = 'NO_EMAIL';

@@ -4,6 +4,7 @@
  */
 
 const studentService = require('../services/studentService');
+const { recordAudit } = require('../lib/authDb');
 
 class StudentController {
   /**

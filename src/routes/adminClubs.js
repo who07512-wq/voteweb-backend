@@ -8,8 +8,9 @@ const express = require('express');
 const router = express.Router();
 const clubController = require('../controllers/clubController');
 const { requireAdmin } = require('../middleware/requireAdmin');
+const { csrfProtection } = require('../middleware/csrfProtection');
 
 // PATCH /api/v1/admin/clubs/:id - Update club (admin only)
-router.patch('/:id', requireAdmin, clubController.update.bind(clubController));
+router.patch('/:id', requireAdmin, csrfProtection, clubController.update.bind(clubController));
 
 module.exports = router;

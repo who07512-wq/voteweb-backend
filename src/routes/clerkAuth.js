@@ -98,13 +98,21 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       return authError(res, 401, 'INVALID_CLERK_TOKEN', 'Clerk token has no subject.');
     }
 
-    // ---- 3. Resolve email: client-provided must match Clerk's primary email ----
+    // ---- 3. Resolve email: MUST be the Clerk primary email when the backend
+    // secret key is configured. If CLERK_SECRET_KEY is missing, we refuse to
+    // trust the client-supplied email (otherwise the "email" the account is
+    // looked up by is attacker-controlled → account takeover). This makes the
+    // bridge fail closed in production rather than silently trusting the client.
     const secretKey = process.env.CLERK_SECRET_KEY;
     const primaryEmail = secretKey
       ? await fetchClerkPrimaryEmail(secretKey, clerkUserId)
       : null;
     const clientEmail = String(req.body.email || '').toLowerCase().trim();
-    const email = primaryEmail || clientEmail;
+    if (!primaryEmail) {
+      // No server-derived email => do NOT fall back to the client's claim.
+      return authError(res, 401, 'CLERK_EMAIL_UNVERIFIED', 'Could not verify your Google email. Please ensure Clerk is configured and your email is verified.');
+    }
+    const email = primaryEmail;
     const requestedRoleRaw = String(req.body.role || '').toUpperCase().trim();
     if (!email || !email.includes('@')) {
       return authError(res, 400, 'NO_EMAIL', 'Google account has no verified email address.');
@@ -156,13 +164,16 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       const isInvitedAdmin = adminList.includes(email);
 
       // Invited admins are created straight as ADMIN.
-      // The CAD portal is OPEN: anyone who signs in through it is granted
-      // CAD. Only ADMIN stays whitelisted (ADMIN_EMAILS).
-      // CANDIDATE is NEVER granted at signup — it is earned when an admin
-      // approves the candidate application (candidateApplicationService.approve).
+      // CAD is gated: when CAD_EMAILS is set, only listed emails become CAD;
+      // when it is unset, the CAD portal is open to any non-admin (documented,
+      // allow-list behavior). CANDIDATE is NEVER granted at signup — it is
+      // earned when an admin approves the candidate application.
+      const isCadAllowed = cadList.length > 0
+        ? cadList.includes(email)
+        : requestedRoleRaw === 'CAD';
       const roleToUse = isInvitedAdmin
         ? 'ADMIN'
-        : requestedRoleRaw === 'CAD'
+        : isCadAllowed
           ? 'CAD'
           : 'STUDENT';
 
@@ -184,14 +195,17 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
       account.role = promoted.role;
       console.log('clerk-session: bootstrapped admin', { email });
     } else if (requestedRoleRaw === 'CAD' && account.role !== 'CAD' && account.role !== 'ADMIN') {
-      // CAD portal is OPEN — promote any non-admin account that signs in
-      // through it to CAD. ADMIN is never demoted.
-      const promoted = await db.query(
-        `UPDATE students SET role = 'CAD' WHERE id = $1 RETURNING role`,
-        [account.id]
-      ).then((r) => r.rows[0]);
-      account.role = promoted.role;
-      console.log('clerk-session: granted CAD', { email });
+      // CAD portal: when CAD_EMAILS is set, only listed emails are promoted;
+      // otherwise open (documented, allow-list behavior). ADMIN never demoted.
+      const isCadAllowed = cadList.length > 0 ? cadList.includes(email) : true;
+      if (isCadAllowed) {
+        const promoted = await db.query(
+          `UPDATE students SET role = 'CAD' WHERE id = $1 RETURNING role`,
+          [account.id]
+        ).then((r) => r.rows[0]);
+        account.role = promoted.role;
+        console.log('clerk-session: granted CAD', { email });
+      }
     }
 
     // ---- 5. Create backend session (cv_sid cookie set here) ----

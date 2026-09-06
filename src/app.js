@@ -144,19 +144,13 @@ app.get('/api/health/db', async (req, res) => {
   }
 });
 
-// Brevo/Email configuration check
+// Brevo/Email configuration check (booleans only — never leak the API key,
+// sender address, or key prefix to unauthenticated health probes).
 app.get('/api/health/brevo', (req, res) => {
-  const hasApiKey = !!process.env.BREVO_API_KEY;
-  const hasSenderEmail = !!process.env.BREVO_SENDER_EMAIL;
-  const hasSenderName = !!process.env.BREVO_SENDER_NAME;
-
   res.json({
-    hasApiKey,
-    hasSenderEmail,
-    hasSenderName,
-    senderEmail: process.env.BREVO_SENDER_EMAIL || 'NOT SET',
-    senderName: process.env.BREVO_SENDER_NAME || 'NOT SET',
-    apiKeyPrefix: process.env.BREVO_API_KEY ? process.env.BREVO_API_KEY.substring(0, 8) + '...' : 'NOT SET',
+    hasApiKey: !!process.env.BREVO_API_KEY,
+    hasSenderEmail: !!process.env.BREVO_SENDER_EMAIL,
+    hasSenderName: !!process.env.BREVO_SENDER_NAME,
   });
 });
 
@@ -332,8 +326,10 @@ app.use('/api/v1/candidates', candidateRoutes);
 // Candidate Applications (authenticated students)
 app.use('/api/candidates', candidateApplicationRoutes);
 
-// Authorization GET endpoint (public read - for authorized students to see their own auth)
-app.get('/api/v1/authorizations/:id', authorizationRoutes);
+// Authorization GET endpoint — a student may read their own authorization;
+// admins/CAD may read any. Ownership is enforced inside the router
+// (requireAuth + canViewAuthorization), never by trusting the client.
+app.use('/api/v1/authorizations', authorizationRoutes);
 
 // Receipt verification (public - receipt ID is the secret)
 app.use('/api/v1/receipts', receiptRoutes);
