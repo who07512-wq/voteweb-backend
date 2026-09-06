@@ -4,10 +4,12 @@
  */
 
 const db = require('../db');
+const notificationService = require('./notificationService');
 
 class AnnouncementService {
   /**
    * Create a new announcement
+   * Notifies approved + rejected candidates when the announcement is published.
    */
   async create({ electionId, title, message, audience = 'all', priority = 'normal', published = false, createdBy }) {
     const result = await db.query(
@@ -25,7 +27,13 @@ class AnnouncementService {
         createdBy || null
       ]
     );
-    return result.rows[0];
+    const announcement = result.rows[0];
+
+    if (announcement.is_published) {
+      await this.notifyCandidates(announcement);
+    }
+
+    return announcement;
   }
 
   /**
@@ -77,8 +85,11 @@ class AnnouncementService {
 
   /**
    * Update announcement
+   * Notifies approved + rejected candidates when the announcement becomes published.
    */
   async update(id, { title, message, audience, priority, isPublished }) {
+    const existing = await this.getById(id);
+
     const updates = [];
     const params = [];
     let paramIndex = 1;
@@ -122,7 +133,14 @@ class AnnouncementService {
 
     const query = `UPDATE announcements SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
     const result = await db.query(query, params);
-    return result.rows[0] || null;
+    const announcement = result.rows[0] || null;
+
+    // Notify only on a draft → published transition (avoid re-notifying on edits of an already-published announcement).
+    if (announcement && announcement.is_published && (!existing || !existing.is_published)) {
+      await this.notifyCandidates(announcement);
+    }
+
+    return announcement;
   }
 
   /**
@@ -141,6 +159,51 @@ class AnnouncementService {
    */
   async setPublished(id, published) {
     return this.update(id, { isPublished: published });
+  }
+
+  /**
+   * Create a notification for every approved and rejected candidate when a
+   * published announcement is created. Respects the audience target:
+   * admin-only announcements do not notify candidates.
+   */
+  async notifyCandidates(announcement) {
+    try {
+      if (!announcement || !announcement.is_published) {
+        return 0;
+      }
+
+      if (announcement.audience === 'admins') {
+        return 0;
+      }
+
+      // Approved + rejected candidates = students with a final decision on
+      // their candidate application (status 'approved' or 'rejected').
+      const result = await db.query(
+        `SELECT DISTINCT student_id
+         FROM candidate_applications
+         WHERE status IN ('approved', 'rejected') AND student_id IS NOT NULL`
+      );
+
+      const userIds = result.rows.map((row) => row.student_id);
+      if (!userIds.length) {
+        return 0;
+      }
+
+      return notificationService.createBulk({
+        userIds,
+        type: 'info',
+        category: 'announcement',
+        priority: announcement.priority || 'normal',
+        title: announcement.title,
+        message: announcement.message,
+        actionUrl: null,
+        actionLabel: null,
+      });
+    } catch (err) {
+      // Announcement creation must not fail because notification delivery failed.
+      console.error('Failed to notify candidates about announcement:', err.message);
+      return 0;
+    }
   }
 }
 

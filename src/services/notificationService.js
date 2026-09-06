@@ -7,6 +7,48 @@ const db = require('../db');
 
 class NotificationService {
   /**
+   * Create a single notification for a user
+   */
+  async create({ userId, type = 'info', category = 'system', priority = 'normal', title, message, actionUrl = null, actionLabel = null }) {
+    const result = await db.query(
+      `INSERT INTO notifications (user_id, type, category, priority, title, message, action_url, action_label)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [userId, type, category, priority, title, message, actionUrl, actionLabel]
+    );
+    return result.rows[0];
+  }
+
+  /**
+   * Create notifications for many users in a single insert
+   */
+  async createBulk({ userIds, type = 'info', category = 'system', priority = 'normal', title, message, actionUrl = null, actionLabel = null }) {
+    if (!userIds || userIds.length === 0) {
+      return 0;
+    }
+
+    const uniqueIds = [...new Set(userIds)];
+    const values = [];
+    const params = [];
+    let paramIndex = 1;
+
+    for (const userId of uniqueIds) {
+      params.push(userId, type, category, priority, title, message, actionUrl, actionLabel);
+      values.push(
+        `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`
+      );
+      paramIndex += 8;
+    }
+
+    await db.query(
+      `INSERT INTO notifications (user_id, type, category, priority, title, message, action_url, action_label)
+       VALUES ${values.join(', ')}`,
+      params
+    );
+    return uniqueIds.length;
+  }
+
+  /**
    * List notifications for a user
    */
   async list({ userId, unreadOnly = false, limit = 50, offset = 0 }) {

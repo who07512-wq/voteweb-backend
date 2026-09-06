@@ -14,6 +14,7 @@ process.env.DATABASE_URL =
 
 const app = require('../src/app');
 const db = require('../src/db');
+const announcementService = require('../src/services/announcementService');
 const { hashPassword } = require('../src/lib/password');
 const { TestClient, randomId } = require('./helpers');
 const { setupTestDatabase } = require('./setup');
@@ -360,4 +361,96 @@ test('POST /mark-all-read requires binding + csrf', async () => {
   await c.login('STU001', 'StudentPassword123!');
   const res = await c.request('POST', '/api/v1/notifications/mark-all-read');
   assert.ok([200, 204, 404].includes(res.status), `got ${res.status}`);
+});
+
+// ============================================================
+// ANNOUNCEMENT → NOTIFICATIONS
+// ============================================================
+test('published announcement creates notifications for approved + rejected candidates', async () => {
+  // Give testStudentId an "approved" application and attackerStudentId a "rejected" one.
+  const enrollmentApproved = `ENR${randomId('')}`.slice(0, 30);
+  const enrollmentRejected = `ENR${randomId('')}`.slice(0, 30);
+  await db.query(
+    `INSERT INTO candidate_applications (student_id, full_name, enrollment_number, department, year, position_id, email, phone, status)
+     VALUES ($1, 'Approved Candidate', $2, 'CS', '3', 1, $3, '9999999990', 'approved')`,
+    [testStudentId, enrollmentApproved, `${testStudentId}@test.local`]
+  );
+  await db.query(
+    `INSERT INTO candidate_applications (student_id, full_name, enrollment_number, department, year, position_id, email, phone, status)
+     VALUES ($1, 'Rejected Candidate', $2, 'CS', '3', 2, $3, '9999999991', 'rejected')`,
+    [attackerStudentId, enrollmentRejected, `${attackerStudentId}@test.local`]
+  );
+
+  await db.query('DELETE FROM notifications WHERE user_id IN ($1, $2)', [testStudentId, attackerStudentId]);
+
+  const announcement = await announcementService.create({
+    title: 'Election Day Reminder',
+    message: 'Voting closes at 5 PM.',
+    audience: 'all',
+    priority: 'high',
+    published: true,
+  });
+
+  try {
+    assert.ok(announcement.is_published);
+
+    const notifs = await db.query(
+      `SELECT user_id, category, title, message, priority, is_read
+       FROM notifications
+       WHERE user_id IN ($1, $2)
+       ORDER BY user_id`,
+      [testStudentId, attackerStudentId]
+    );
+
+    const seen = new Map(notifs.rows.map((n) => [n.user_id, n]));
+    assert.equal(notifs.rows.length, 2, 'one notification per candidate');
+    assert.ok(seen.has(testStudentId), 'approved candidate notified');
+    assert.ok(seen.has(attackerStudentId), 'rejected candidate notified');
+
+    for (const row of notifs.rows) {
+      assert.equal(row.category, 'announcement');
+      assert.equal(row.title, 'Election Day Reminder');
+      assert.equal(row.message, 'Voting closes at 5 PM.');
+      assert.equal(row.priority, 'high');
+      assert.equal(row.is_read, false);
+    }
+  } finally {
+    await db.query('DELETE FROM candidate_applications WHERE student_id = ANY($1::int[])', [[testStudentId, attackerStudentId]]);
+  }
+});
+
+test('unpublished announcement does not notify candidates', async () => {
+  await db.query('DELETE FROM notifications WHERE user_id IN ($1, $2)', [testStudentId, attackerStudentId]);
+
+  const draft = await announcementService.create({
+    title: 'Draft Announcement',
+    message: 'Should not notify.',
+    audience: 'all',
+    published: false,
+  });
+
+  assert.equal(draft.is_published, false);
+  const notifs = await db.query(
+    'SELECT COUNT(*) FROM notifications WHERE user_id IN ($1, $2)',
+    [testStudentId, attackerStudentId]
+  );
+  assert.equal(parseInt(notifs.rows[0].count), 0);
+});
+
+test('admin-only announcement does not notify candidates', async () => {
+  await db.query('DELETE FROM notifications WHERE user_id IN ($1, $2)', [testStudentId, attackerStudentId]);
+
+  const announcement = await announcementService.create({
+    title: 'Staff Notice',
+    message: 'Internal.',
+    audience: 'admins',
+    published: true,
+  });
+
+  assert.equal(announcement.is_published, true);
+  const notifs = await db.query(
+    'SELECT COUNT(*) FROM notifications WHERE user_id IN ($1, $2)',
+    [testStudentId, attackerStudentId]
+  );
+  assert.equal(parseInt(notifs.rows[0].count), 0);
 });
