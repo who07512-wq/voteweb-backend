@@ -143,7 +143,7 @@ class StudentController {
   async update(req, res, next) {
     try {
       const { id } = req.params;
-      const { name, email, voting_eligible, role } = req.body;
+      const { name, email, voting_eligible, role, department, year_or_semester, section } = req.body;
 
       if (!id || isNaN(parseInt(id))) {
         return res.status(400).json({
@@ -182,6 +182,37 @@ class StudentController {
         });
       }
 
+      if (
+        department !== undefined &&
+        (typeof department !== 'string' || department.trim() === '')
+      ) {
+        return res.status(400).json({
+          error: 'Validation Error',
+          message: 'department must be a non-empty string if provided',
+        });
+      }
+
+      if (
+        year_or_semester !== undefined &&
+        (typeof year_or_semester !== 'string' || year_or_semester.trim() === '')
+      ) {
+        return res.status(400).json({
+          error: 'Validation Error',
+          message: 'year_or_semester must be a non-empty string if provided',
+        });
+      }
+
+      if (
+        section !== undefined &&
+        section !== null &&
+        (typeof section !== 'string' || section.trim() === '' || section.trim().length > 20)
+      ) {
+        return res.status(400).json({
+          error: 'Validation Error',
+          message: 'section must be a non-empty string up to 20 characters if provided',
+        });
+      }
+
       // Guard: an admin must never demote themselves (lockout protection)
       if (role !== undefined && role !== 'ADMIN' && req.user && req.user.studentId === parseInt(id)) {
         return res.status(400).json({
@@ -195,6 +226,9 @@ class StudentController {
         email: email !== undefined ? (email ? email.trim() : null) : undefined,
         voting_eligible: voting_eligible !== undefined ? voting_eligible : undefined,
         role: role !== undefined ? role : undefined,
+        department: department !== undefined ? department.trim() : undefined,
+        year_or_semester: year_or_semester !== undefined ? year_or_semester.trim() : undefined,
+        section: section !== undefined ? (section ? section.trim().toUpperCase() : null) : undefined,
       });
 
       if (!student) {
@@ -217,6 +251,13 @@ class StudentController {
           studentId: parseInt(id),
           ip: req.ip || null,
           metadata: { newRole: role, changedBy: req.user?.email || null },
+        });
+      }
+      if (department !== undefined || year_or_semester !== undefined || section !== undefined) {
+        await recordAudit('STUDENT_SECTION_CHANGED', {
+          studentId: parseInt(id),
+          ip: req.ip || null,
+          metadata: { department, year_or_semester, section, changedBy: req.user?.email || null },
         });
       }
 

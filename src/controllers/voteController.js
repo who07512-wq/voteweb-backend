@@ -10,6 +10,7 @@
 
 const voteService = require('../services/voteService');
 const db = require('../db');
+const constituencyService = require('../services/constituencyService');
 
 class VoteController {
   /**
@@ -21,7 +22,7 @@ class VoteController {
   async submitVote(req, res, next) {
     try {
       const { electionId } = req.params;
-      const { club_id, position_id, candidate_id, student_id: bodyStudentId } = req.body;
+      const { club_id, constituency_id, position_id, candidate_id, student_id: bodyStudentId } = req.body;
 
       // SECURITY: Get student identity from authenticated session ONLY
       // NEVER trust student_id from request body for production
@@ -52,22 +53,32 @@ class VoteController {
       // Use authenticated identity
       const studentId = authenticatedStudentId;
 
-      // Validation: required fields
-      if (!club_id || !position_id || !candidate_id) {
+      // Validation: required fields. Either club_id (club position) or
+      // constituency_id (CR position) is required; the vote service resolves
+      // which scope a position demands.
+      if (!position_id || !candidate_id) {
         return res.status(400).json({
           error: 'Bad Request',
-          message: 'club_id, position_id, and candidate_id are required.',
+          message: 'position_id and candidate_id are required.',
+        });
+      }
+
+      if ((!club_id && !constituency_id)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Either club_id or constituency_id is required.',
         });
       }
 
       // Parse IDs
-      const clubId = parseToInt(club_id);
+      const clubId = club_id ? parseToInt(club_id) : null;
+      const constituencyId = constituency_id ? parseToInt(constituency_id) : null;
       const positionId = parseToInt(position_id);
       const candidateId = parseToInt(candidate_id);
       const electionIdInt = parseToInt(electionId);
 
       // Validate formats
-      if ([clubId, positionId, candidateId, electionIdInt].some(isNaN)) {
+      if ([positionId, candidateId, electionIdInt].some(isNaN)) {
         return res.status(400).json({
           error: 'Bad Request',
           message: 'Invalid ID format.',
@@ -79,6 +90,7 @@ class VoteController {
         studentId,
         electionId: electionIdInt,
         clubId,
+        constituencyId,
         positionId,
         candidateId,
       });
@@ -158,6 +170,68 @@ class VoteController {
         }
       });
 
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/elections/:electionId/votes/my-constituency
+   * Resolve the authenticated student's Class Representative constituency in
+   * this election from their stored department/year/section.
+   *
+   * Security: identity comes from the session only; enrollments may be read
+   * back from the students row (the same source used at vote time).
+   */
+  async getMyConstituency(req, res, next) {
+    try {
+      const { electionId } = req.params;
+
+      // SECURITY: Get student identity from authenticated session ONLY
+      const authenticatedStudentId = req.user?.studentId;
+
+      if (!authenticatedStudentId) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      const electionIdInt = parseToInt(electionId);
+      if (isNaN(electionIdInt)) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid electionId format.',
+        });
+      }
+
+      const student = await db.query(
+        'SELECT department, year_or_semester, section FROM students WHERE id = $1',
+        [authenticatedStudentId]
+      );
+
+      if (student.rows.length === 0) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Student not found.',
+          code: 'STUDENT_NOT_FOUND',
+        });
+      }
+
+      const row = student.rows[0];
+      if (!row.section) {
+        return res.json({ data: { constituency: null } });
+      }
+
+      const constituency = await constituencyService.findMatching({
+        electionId: electionIdInt,
+        department: row.department,
+        year: row.year_or_semester,
+        section: row.section,
+      });
+
+      res.json({ data: { constituency } });
     } catch (err) {
       next(err);
     }

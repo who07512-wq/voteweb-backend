@@ -5,6 +5,8 @@
 
 const db = require('../db');
 const candidateService = require('./candidateService');
+const constituencyService = require('./constituencyService');
+const positionService = require('./positionService');
 
 class CandidateApplicationService {
   /**
@@ -30,6 +32,8 @@ class CandidateApplicationService {
       dateOfBirth,
       gender,
       aadharNumber,
+      category,
+      electionId,
     } = data;
 
     // Check if enrollment number already has an application (not rejected)
@@ -43,6 +47,14 @@ class CandidateApplicationService {
       const error = new Error('An application already exists for this enrollment number.');
       error.code = 'DUPLICATE_ENROLLMENT';
       error.status = 409;
+      throw error;
+    }
+
+    const appCategory = (category || 'CLUB').toUpperCase();
+    if (appCategory !== 'CLUB' && appCategory !== 'CR' && appCategory !== 'CLASS_REPRESENTATIVE') {
+      const error = new Error('Invalid category.');
+      error.code = 'INVALID_CATEGORY';
+      error.status = 400;
       throw error;
     }
 
@@ -62,20 +74,36 @@ class CandidateApplicationService {
       }
     }
 
+    // Verify the election exists when supplied (optional at apply time; the
+    // admin assigns the definitive election/constituency at approval).
+    if (electionId) {
+      const electionCheck = await db.query(
+        'SELECT id FROM elections WHERE id = $1',
+        [parseInt(electionId)]
+      );
+      if (electionCheck.rows.length === 0) {
+        const error = new Error('Invalid election selected.');
+        error.code = 'INVALID_ELECTION';
+        error.status = 400;
+        throw error;
+      }
+    }
+
     // Create the application with status = under_review
     const result = await db.query(
       `INSERT INTO candidate_applications (
         student_id, full_name, enrollment_number, department, year, semester, section,
         position_id, nomination_club, contesting_position, email, phone, profile_photo_url, bio, manifesto,
-        age, date_of_birth, gender, aadhar_number,
+        age, date_of_birth, gender, aadhar_number, category, election_id,
         status, submitted_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'under_review', NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, 'under_review', NOW())
       RETURNING *`,
       [
         studentId, fullName, enrollmentNumber, department, year, semester || null, section || null,
         positionId || null, nominationClub || null, contestingPosition || null,
         email, phone, profilePhotoUrl || null, bio || null, manifesto || null,
         age || null, dateOfBirth || null, gender || null, aadharNumber || null,
+        appCategory, electionId ? parseInt(electionId) : null,
       ]
     );
 
@@ -217,8 +245,16 @@ class CandidateApplicationService {
 
   /**
    * Approve application
+   *
+   * For Class Representative (CR) applications the admin must resolve the
+   * election + constituency seat the applicant will contest. The server
+   * enforces that the assigned constituency's department/year/section matches
+   * the application's identity exactly, then sets position_id and creates the
+   * ballot row for the constituency's CR position.
+   *
+   * context: { electionId?, constituencyId? }
    */
-  async approve(id, adminId) {
+  async approve(id, adminId, context = {}) {
     const app = await this.getById(id);
 
     if (!app) {
@@ -235,15 +271,103 @@ class CandidateApplicationService {
       throw error;
     }
 
+    const isCR = app.category === 'CR' || app.category === 'CLASS_REPRESENTATIVE';
+
+    // Resolve the CR election + constituency + position up-front so the
+    // update can set all of the ballot data authoritatively.
+    let crElectionId = null;
+    if (isCR) {
+      let constituencyId = context.constituencyId ? parseInt(context.constituencyId) : null;
+      let electionId = context.electionId ? parseInt(context.electionId) : null;
+
+      if (constituencyId) {
+        const constituency = await constituencyService.findById(constituencyId);
+        if (!constituency) {
+          const error = new Error('Constituency not found.');
+          error.code = 'CONSTITUENCY_NOT_FOUND';
+          error.status = 404;
+          throw error;
+        }
+
+        const match = (a, b) => (a ?? '').toString().trim().toLowerCase() === (b ?? '').toString().trim().toLowerCase();
+        if (!match(constituency.department, app.department) ||
+            !match(constituency.year, app.year) ||
+            !match(constituency.section, app.section)) {
+          const error = new Error(
+            'Constituency does not match the applicant\u2019s department/year/section.'
+          );
+          error.code = 'CONSTITUENCY_MISMATCH';
+          error.status = 400;
+          throw error;
+        }
+
+        electionId = electionId || constituency.election_id;
+        if (electionId !== constituency.election_id) {
+          const error = new Error('Election does not match the constituency\u2019s election.');
+          error.code = 'CONSTITUENCY_MISMATCH';
+          error.status = 400;
+          throw error;
+        }
+      } else {
+        // No explicit constituency: resolve from the applicant identity against
+        // the supplied (or application's) election.
+        electionId = electionId || app.electionId;
+        if (!electionId) {
+          const error = new Error(
+            'For Class Representative applications an election is required.'
+          );
+          error.code = 'ELECTION_REQUIRED';
+          error.status = 400;
+          throw error;
+        }
+        const constituency = await constituencyService.findMatching({
+          electionId,
+          department: app.department,
+          year: app.year,
+          section: app.section,
+          activeOnly: true,
+        });
+        if (!constituency) {
+          const error = new Error(
+            'No matching Class Representative constituency exists for this applicant in the selected election.'
+          );
+          error.code = 'CONSTITUENCY_NOT_FOUND';
+          error.status = 404;
+          throw error;
+        }
+        constituencyId = constituency.id;
+      }
+
+      // CR position for the constituency (auto-created with the constituency).
+      const positions = await positionService.findByConstituencyId(constituencyId);
+      const crPosition = positions.find(p => p.constituency_id === constituencyId);
+      if (!crPosition) {
+        const error = new Error('No Class Representative position exists for this constituency.');
+        error.code = 'CONSTITUENCY_POSITION_MISSING';
+        error.status = 409;
+        throw error;
+      }
+
+      crElectionId = electionId;
+      context._constituencyId = constituencyId;
+      context._positionId = crPosition.id;
+    }
+
     const result = await db.query(
       `UPDATE candidate_applications
        SET status = 'approved',
            reviewed_by = $1,
            reviewed_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $2
+           updated_at = NOW(),
+           election_id = COALESCE($3, election_id),
+           position_id = COALESCE($4, position_id)
+       WHERE id = $2 AND status = 'under_review'
        RETURNING *`,
-      [adminId, id]
+      [
+        adminId, id,
+        isCR ? crElectionId : null,
+        isCR ? context._positionId : null,
+      ]
     );
 
     // Approval is what EARNS the applicant the CANDIDATE role. The login-time
@@ -259,8 +383,8 @@ class CandidateApplicationService {
 
     // Also create a ballot row in `candidates` so the approved applicant
     // actually appears on the ballot. Only possible when a position_id was
-    // supplied (position_id is optional on the application). Dell: if no
-    // position, the candidate cannot be on a ballot; skip silently.
+    // supplied (position_id is optional on the application). If no position,
+    // the candidate cannot be on a ballot; skip silently.
     if (result.rows[0].position_id) {
       try {
         await candidateService.create({
@@ -529,6 +653,8 @@ class CandidateApplicationService {
       dateOfBirth: row.date_of_birth,
       gender: row.gender,
       aadharNumber: row.aadhar_number,
+      category: row.category || 'CLUB',
+      electionId: row.election_id || null,
       status: row.status,
       rejectionReason: row.rejection_reason,
       changesRequestedReason: row.changes_requested_reason,

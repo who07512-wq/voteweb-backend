@@ -35,6 +35,8 @@ const adminAuthorization = require('./routes/adminAuthorization');
 const adminAnnouncements = require('./routes/adminAnnouncements');
 const adminSupport = require('./routes/adminSupport');
 const voteRoutes = require('./routes/votes');
+const constituencyRoutes = require('./routes/constituencies');
+const adminConstituencyRoutes = require('./routes/adminConstituencies');
 const receiptRoutes = require('./routes/receipts');
 const notificationRoutes = require('./routes/notifications');
 const supportRoutes = require('./routes/support');
@@ -320,6 +322,9 @@ app.get('/api/v1/positions/:positionId/candidates', candidateController.list.bin
 // Positions (public read)
 app.use('/api/v1/positions', positionRoutes);
 
+// Constituencies (public read — CR ballot data)
+app.use('/api/v1/constituencies', constituencyRoutes);
+
 // Candidates (public read)
 app.use('/api/v1/candidates', candidateRoutes);
 
@@ -373,6 +378,7 @@ app.use('/api/v1/admin/students', requireAdmin, adminStudents);
 app.use('/api/v1/admin/elections', requireAdmin, adminElections);
 app.use('/api/v1/admin/clubs', requireAdmin, adminClubs);
 app.use('/api/v1/admin/positions', requireAdmin, adminPositions);
+app.use('/api/v1/admin/constituencies', requireAdmin, adminConstituencyRoutes);
 app.use('/api/v1/admin/candidates', requireAdmin, adminCandidates);
 app.use('/api/v1/admin/candidate-applications', requireAdmin, adminCandidateAppRoutes);
 app.use('/api/v1/admin/authorizations', requireAdmin, adminAuthorization);

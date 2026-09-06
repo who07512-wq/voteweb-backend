@@ -18,6 +18,9 @@ const { voteLimiter } = require('../middleware/rateLimiter');
 // POST /api/v1/elections/:electionId/votes - Submit a vote (authenticated only)
 router.post('/:electionId/votes', requireAuth, csrfProtection, voteLimiter, voteController.submitVote.bind(voteController));
 
+// GET /api/v1/elections/:electionId/votes/my-constituency - Student's own CR seat (authenticated only)
+router.get('/:electionId/votes/my-constituency', requireAuth, voteController.getMyConstituency.bind(voteController));
+
 // GET /api/v1/elections/:electionId/votes/check - Check if authenticated student has voted
 // Student identity comes from session, NOT from query params
 router.get('/:electionId/votes/check', requireAuth, voteController.checkVotes.bind(voteController));

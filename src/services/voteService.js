@@ -11,21 +11,40 @@ class VoteService {
   /**
    * Cast a vote with full validation
    * Returns { success, vote, error, status }
+   *
+   * Supports two ballot paths in a mixed election:
+   *  - CLUB position  : club_id is required, constituency ignored
+   *  - CR position    : constituency_id is required, club ignored
+   * The authoritative discriminator is the position row itself
+   * (position.club_id XOR position.constituency_id).
    */
-  async castVote({ studentId, electionId, clubId, positionId, candidateId }) {
+  async castVote({ studentId, electionId, clubId, positionId, candidateId, constituencyId }) {
     // Step 1: Validate all IDs are integers
     const parsedStudentId = parseInt(studentId);
     const parsedElectionId = parseInt(electionId);
-    const parsedClubId = parseInt(clubId);
+    const parsedClubId = clubId !== null && clubId !== undefined && clubId !== '' ? parseInt(clubId) : NaN;
+    const parsedConstituencyId = constituencyId !== null && constituencyId !== undefined && constituencyId !== '' ? parseInt(constituencyId) : NaN;
     const parsedPositionId = parseInt(positionId);
     const parsedCandidateId = parseInt(candidateId);
 
     if (isNaN(parsedStudentId) || isNaN(parsedElectionId) ||
-        isNaN(parsedClubId) || isNaN(parsedPositionId) || isNaN(parsedCandidateId)) {
+        isNaN(parsedPositionId) || isNaN(parsedCandidateId)) {
       return {
         success: false,
         error: 'Invalid ID format',
         code: 'INVALID_ID',
+        status: 400
+      };
+    }
+
+    // Exactly one of club_id / constituency_id may be supplied.
+    const hasClub = !isNaN(parsedClubId);
+    const hasConstituency = !isNaN(parsedConstituencyId);
+    if (hasClub && hasConstituency) {
+      return {
+        success: false,
+        error: 'Cannot supply both club_id and constituency_id for one vote',
+        code: 'INVALID_BALLOT_SCOPE',
         status: 400
       };
     }
@@ -102,7 +121,42 @@ class VoteService {
       };
     }
 
-    // Step 4: Check authorization
+    // Step 4: Resolve the position — it decides which ballot path is valid.
+    const positionCheck = await db.query(
+      'SELECT id, club_id, constituency_id FROM positions WHERE id = $1 AND is_active = true',
+      [parsedPositionId]
+    );
+
+    if (positionCheck.rows.length === 0) {
+      return {
+        success: false,
+        error: 'Position not found or inactive',
+        code: 'POSITION_NOT_FOUND',
+        status: 404
+      };
+    }
+
+    const position = positionCheck.rows[0];
+    const isConstituencyPosition = position.constituency_id !== null && position.constituency_id !== undefined;
+
+    if (hasClub && isConstituencyPosition) {
+      return {
+        success: false,
+        error: 'This position is a Class Representative seat; constituency_id is required',
+        code: 'INVALID_BALLOT_SCOPE',
+        status: 400
+      };
+    }
+    if (hasConstituency && !isConstituencyPosition) {
+      return {
+        success: false,
+        error: 'This position belongs to a club; club_id is required',
+        code: 'INVALID_BALLOT_SCOPE',
+        status: 400
+      };
+    }
+
+    // Step 5: Check authorization
     const authCheck = await db.query(
       `SELECT id, club_id, is_authorized, expires_at
        FROM voter_authorizations
@@ -119,7 +173,24 @@ class VoteService {
       };
     }
 
-    const authorization = authCheck.rows[0];
+    // The voter must hold an election-wide authorization (club_id IS NULL) to
+    // vote on CR positions; a club-scoped authorization never covers CR seats.
+    const authorizations = authCheck.rows;
+    let authorization;
+    if (isConstituencyPosition) {
+      authorization = authorizations.find(row => row.club_id === null) || null;
+      if (!authorization) {
+        return {
+          success: false,
+          error: 'Student is not authorized for Class Representative voting',
+          code: 'NOT_AUTHORIZED_FOR_CONSTITUENCY',
+          status: 403
+        };
+      }
+    } else {
+      // Club path: pick the first valid authorization, then enforce scope below.
+      authorization = authorizations[0];
+    }
 
     // Check authorization expiration
     if (authorization.expires_at && new Date(authorization.expires_at) < now) {
@@ -131,49 +202,111 @@ class VoteService {
       };
     }
 
-    // Check club-specific authorization
-    // If authorization has a specific club_id, student can only vote in that club
-    // If authorization has NULL club_id, student can vote in any club
-    if (authorization.club_id !== null && authorization.club_id !== parsedClubId) {
-      return {
-        success: false,
-        error: 'Student is not authorized for this club',
-        code: 'NOT_AUTHORIZED_FOR_CLUB',
-        status: 403
-      };
+    if (!isConstituencyPosition) {
+      // Club-specific authorization: exact club only, or election-wide (NULL).
+      const ok = authorization.club_id === null || authorization.club_id === position.club_id;
+      if (!ok) {
+        return {
+          success: false,
+          error: 'Student is not authorized for this club',
+          code: 'NOT_AUTHORIZED_FOR_CLUB',
+          status: 403
+        };
+      }
     }
 
-    // Step 5: Verify club belongs to election
-    const clubCheck = await db.query(
-      'SELECT id FROM clubs WHERE id = $1 AND election_id = $2 AND is_active = true',
-      [parsedClubId, parsedElectionId]
-    );
+    let voteClubId = null;
+    let voteConstituencyId = null;
 
-    if (clubCheck.rows.length === 0) {
-      return {
-        success: false,
-        error: 'Club not found in this election',
-        code: 'CLUB_NOT_FOUND',
-        status: 404
-      };
+    if (isConstituencyPosition) {
+      // ---- CR path ----
+      if (!hasConstituency || parsedConstituencyId !== position.constituency_id) {
+        return {
+          success: false,
+          error: 'Constituency does not belong to this position',
+          code: 'CONSTITUENCY_NOT_FOUND',
+          status: 404
+        };
+      }
+
+      // Step 6-CR: Verify constituency belongs to election and is active
+      const constituencyCheck = await db.query(
+        'SELECT id, election_id, department, year, section, is_active FROM constituencies WHERE id = $1',
+        [parsedConstituencyId]
+      );
+
+      if (constituencyCheck.rows.length === 0 || constituencyCheck.rows[0].election_id !== parsedElectionId) {
+        return {
+          success: false,
+          error: 'Constituency not found in this election',
+          code: 'CONSTITUENCY_NOT_FOUND',
+          status: 404
+        };
+      }
+
+      const constituency = constituencyCheck.rows[0];
+      if (!constituency.is_active) {
+        return {
+          success: false,
+          error: 'Constituency is not active',
+          code: 'CONSTITUENCY_INACTIVE',
+          status: 403
+        };
+      }
+
+      // Step 7-CR: Server-side eligibility — the voter must belong to the
+      // same department, year and section as the constituency. Identity is
+      // read from the students row (server state), never from the request.
+      const voterIdentity = await db.query(
+        'SELECT department, year_or_semester, section FROM students WHERE id = $1',
+        [parsedStudentId]
+      );
+
+      const voter = voterIdentity.rows[0];
+      const match = (a, b) => (a ?? '').toString().trim().toLowerCase() === (b ?? '').toString().trim().toLowerCase();
+
+      if (!match(constituency.department, voter.department) ||
+          !match(constituency.year, voter.year_or_semester) ||
+          !match(constituency.section, voter.section)) {
+        return {
+          success: false,
+          error: 'You can only vote for the Class Representative of your own department, year and section',
+          code: 'CONSTITUENCY_MISMATCH',
+          status: 403
+        };
+      }
+
+      voteConstituencyId = parsedConstituencyId;
+    } else {
+      // ---- Club path ----
+      if (!hasClub || parsedClubId !== position.club_id) {
+        return {
+          success: false,
+          error: 'Club not found in this election',
+          code: 'CLUB_NOT_FOUND',
+          status: 404
+        };
+      }
+
+      // Verify club belongs to election
+      const clubCheck = await db.query(
+        'SELECT id FROM clubs WHERE id = $1 AND election_id = $2 AND is_active = true',
+        [parsedClubId, parsedElectionId]
+      );
+
+      if (clubCheck.rows.length === 0) {
+        return {
+          success: false,
+          error: 'Club not found in this election',
+          code: 'CLUB_NOT_FOUND',
+          status: 404
+        };
+      }
+
+      voteClubId = parsedClubId;
     }
 
-    // Step 6: Verify position belongs to club
-    const positionCheck = await db.query(
-      'SELECT id FROM positions WHERE id = $1 AND club_id = $2 AND is_active = true',
-      [parsedPositionId, parsedClubId]
-    );
-
-    if (positionCheck.rows.length === 0) {
-      return {
-        success: false,
-        error: 'Position not found in this club',
-        code: 'POSITION_NOT_FOUND',
-        status: 404
-      };
-    }
-
-    // Step 7: Verify candidate belongs to position and is active
+    // Step 8: Verify candidate belongs to position and is active
     const candidateCheck = await db.query(
       'SELECT id FROM candidates WHERE id = $1 AND position_id = $2 AND is_active = true',
       [parsedCandidateId, parsedPositionId]
@@ -188,7 +321,7 @@ class VoteService {
       };
     }
 
-    // Step 8: Check for duplicate vote
+    // Step 9: Check for duplicate vote
     const duplicateCheck = await db.query(
       `SELECT id FROM votes
        WHERE student_id = $1 AND election_id = $2 AND position_id = $3`,
@@ -204,14 +337,14 @@ class VoteService {
       };
     }
 
-    // Step 9: Record the vote (database unique constraint is the final authority)
+    // Step 10: Record the vote (database unique constraint is the final authority)
     let voteResult;
     try {
       voteResult = await db.query(
-        `INSERT INTO votes (student_id, election_id, club_id, position_id, candidate_id, voted_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())
-         RETURNING id, student_id, election_id, club_id, position_id, candidate_id, voted_at`,
-        [parsedStudentId, parsedElectionId, parsedClubId, parsedPositionId, parsedCandidateId]
+        `INSERT INTO votes (student_id, election_id, club_id, constituency_id, position_id, candidate_id, voted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         RETURNING id, student_id, election_id, club_id, constituency_id, position_id, candidate_id, voted_at`,
+        [parsedStudentId, parsedElectionId, voteClubId, voteConstituencyId, parsedPositionId, parsedCandidateId]
       );
     } catch (err) {
       // Handle duplicate vote constraint violation (race condition protection)
@@ -226,7 +359,7 @@ class VoteService {
       throw err;
     }
 
-    // Step 10: Generate vote receipt
+    // Step 11: Generate vote receipt
     const vote = voteResult.rows[0];
     const receipt = await this.generateReceipt(vote.id, vote.election_id, vote.student_id);
 
@@ -277,9 +410,10 @@ class VoteService {
 
   /**
    * Get vote counts for an election (for results - called by admin)
+   * Returns club rows AND constituency (CR) rows.
    */
   async getElectionResults(electionId) {
-    const results = await db.query(
+    const clubResults = await db.query(
       `SELECT
         v.candidate_id,
         c.name as candidate_name,
@@ -287,6 +421,8 @@ class VoteService {
         p.name as position_name,
         p.club_id,
         cl.name as club_name,
+        NULL::integer as constituency_id,
+        NULL::text as constituency_name,
         COUNT(v.id) as vote_count
        FROM votes v
        JOIN candidates c ON v.candidate_id = c.id
@@ -298,7 +434,29 @@ class VoteService {
       [electionId]
     );
 
-    return results.rows;
+    const constituencyResults = await db.query(
+      `SELECT
+        v.candidate_id,
+        c.name as candidate_name,
+        c.position_id,
+        p.name as position_name,
+        NULL::integer as club_id,
+        NULL::text as club_name,
+        p.constituency_id,
+        ct.name as constituency_name,
+        COUNT(v.id) as vote_count
+       FROM votes v
+       JOIN candidates c ON v.candidate_id = c.id
+       JOIN positions p ON v.position_id = p.id
+       JOIN constituencies ct ON p.constituency_id = ct.id
+       WHERE v.election_id = $1
+       GROUP BY v.candidate_id, c.name, v.position_id, p.name, p.constituency_id, ct.name
+       ORDER BY ct.department, ct.year, ct.section, p.display_order, c.display_order, vote_count DESC`,
+      [electionId]
+    );
+
+    const results = clubResults.rows.concat(constituencyResults.rows);
+    return results;
   }
 
   /**
@@ -322,8 +480,96 @@ class VoteService {
   }
 
   /**
+   * Process a raw results rowset into groups (club OR constituency) with
+   * percentages, ties and winner/elected status. Assumes rows carry:
+   *   <group>_id, <group>_name, position_id, position_name, max_selections,
+   *   candidate_id, candidate_name, vote_count
+   */
+  _groupResults(rows, groupIdKey, groupNameKey) {
+    const groups = {};
+    let totalCandidates = 0;
+
+    for (const row of rows) {
+      const gid = row[groupIdKey];
+      if (!groups[gid]) {
+        groups[gid] = {
+          [groupIdKey]: gid,
+          [groupNameKey]: row[groupNameKey],
+          positions: {},
+        };
+      }
+
+      const group = groups[gid];
+      if (!group.positions[row.position_id]) {
+        group.positions[row.position_id] = {
+          position_id: row.position_id,
+          position_name: row.position_name,
+          max_selections: row.max_selections || 1,
+          candidates: [],
+          total_votes: 0,
+        };
+      }
+
+      group.positions[row.position_id].candidates.push({
+        candidate_id: row.candidate_id,
+        candidate_name: row.candidate_name,
+        vote_count: parseInt(row.vote_count),
+      });
+
+      group.positions[row.position_id].total_votes += parseInt(row.vote_count);
+      totalCandidates++;
+    }
+
+    // Calculate percentages and ranks per position within each group.
+    for (const gid of Object.keys(groups)) {
+      for (const posId of Object.keys(groups[gid].positions)) {
+        const pos = groups[gid].positions[posId];
+        const total = pos.total_votes;
+
+        let maxVotes = 0;
+        for (const cand of pos.candidates) {
+          cand.percentage = total > 0 ? (cand.vote_count / total) * 100 : 0;
+          if (cand.vote_count > maxVotes) {
+            maxVotes = cand.vote_count;
+          }
+        }
+
+        pos.candidates.sort((a, b) => b.vote_count - a.vote_count);
+        let rank = 1;
+        let prevVotes = -1;
+        for (const cand of pos.candidates) {
+          if (cand.vote_count !== prevVotes) {
+            cand.rank = rank;
+          }
+
+          if (rank === 1) {
+            cand.status = 'winner';
+          } else if (rank === 2 && cand.vote_count === maxVotes) {
+            cand.status = 'winner';
+          } else if (rank <= pos.max_selections) {
+            cand.status = 'elected';
+          } else {
+            cand.status = 'not_elected';
+          }
+
+          prevVotes = cand.vote_count;
+          rank++;
+        }
+
+        groups[gid].positions = Object.values(groups[gid].positions);
+      }
+    }
+
+    return {
+      groups: Object.values(groups),
+      totalCandidates,
+    };
+  }
+
+  /**
    * Get comprehensive election results
-   * Returns results by club -> position -> candidates
+   * Returns results by club -> position -> candidates (and, in mixed
+   * elections, by constituency -> position -> candidates).
    */
   async getElectionResultsFull(electionId) {
     // Get election info
@@ -350,8 +596,8 @@ class VoteService {
       [electionId]
     );
 
-    // Get results by club/position/candidate
-    const results = await db.query(
+    // Get club-backed results
+    const clubRows = await db.query(
       `SELECT
         cl.id as club_id,
         cl.name as club_name,
@@ -371,91 +617,34 @@ class VoteService {
       [electionId]
     );
 
+    // Get constituency-backed results (CR positions)
+    const constituencyRows = await db.query(
+      `SELECT
+        ct.id as constituency_id,
+        ct.name as constituency_name,
+        p.id as position_id,
+        p.name as position_name,
+        COALESCE(p.max_selections, 1) as max_selections,
+        c.id as candidate_id,
+        c.name as candidate_name,
+        COUNT(v.id) as vote_count
+       FROM votes v
+       JOIN candidates c ON v.candidate_id = c.id
+       JOIN positions p ON v.position_id = p.id
+       JOIN constituencies ct ON p.constituency_id = ct.id
+       WHERE v.election_id = $1
+       GROUP BY ct.id, ct.name, p.id, p.name, COALESCE(p.max_selections, 1), p.display_order, c.id, c.name, c.display_order
+       ORDER BY ct.department, ct.year, ct.section, p.display_order, c.display_order, vote_count DESC`,
+      [electionId]
+    );
+
     // Calculate totals
     const eligibleCount = parseInt(eligible.rows[0]?.count || 0);
     const votedCount = parseInt(totalVotes.rows[0]?.count || 0);
     const participationRate = eligibleCount > 0 ? (votedCount / eligibleCount) * 100 : 0;
 
-    // Group by club and position
-    const clubs = {};
-    let totalCandidates = 0;
-
-    for (const row of results.rows) {
-      if (!clubs[row.club_id]) {
-        clubs[row.club_id] = {
-          club_id: row.club_id,
-          club_name: row.club_name,
-          positions: {},
-        };
-      }
-
-      if (!clubs[row.club_id].positions[row.position_id]) {
-        clubs[row.club_id].positions[row.position_id] = {
-          position_id: row.position_id,
-          position_name: row.position_name,
-          max_selections: row.max_selections || 1,
-          candidates: [],
-          total_votes: 0,
-        };
-      }
-
-      clubs[row.club_id].positions[row.position_id].candidates.push({
-        candidate_id: row.candidate_id,
-        candidate_name: row.candidate_name,
-        vote_count: parseInt(row.vote_count),
-      });
-
-      clubs[row.club_id].positions[row.position_id].total_votes += parseInt(row.vote_count);
-      totalCandidates++;
-    }
-
-    // Calculate percentages and ranks
-    for (const clubId of Object.keys(clubs)) {
-      for (const posId of Object.keys(clubs[clubId].positions)) {
-        const pos = clubs[clubId].positions[posId];
-        const total = pos.total_votes;
-
-        // Calculate percentages and determine winners
-        let maxVotes = 0;
-        for (const cand of pos.candidates) {
-          cand.percentage = total > 0 ? (cand.vote_count / total) * 100 : 0;
-          if (cand.vote_count > maxVotes) {
-            maxVotes = cand.vote_count;
-          }
-        }
-
-        // Rank candidates and determine status
-        pos.candidates.sort((a, b) => b.vote_count - a.vote_count);
-        let rank = 1;
-        let prevVotes = -1;
-        for (const cand of pos.candidates) {
-          if (cand.vote_count === prevVotes) {
-            // Tie - same rank
-          } else {
-            cand.rank = rank;
-          }
-
-          if (rank === 1) {
-            cand.status = 'winner';
-          } else if (rank === 2 && cand.vote_count === maxVotes) {
-            cand.status = 'winner';
-          } else if (rank <= pos.max_selections) {
-            cand.status = 'elected';
-          } else {
-            cand.status = 'not_elected';
-          }
-
-          prevVotes = cand.vote_count;
-          rank++;
-        }
-
-        // Convert positions to array
-        clubs[clubId].positions = Object.values(clubs[clubId].positions);
-      }
-
-      // Convert clubs to array
-      clubs[clubId] = clubs[clubId];
-    }
+    const clubGrouped = this._groupResults(clubRows.rows, 'club_id', 'club_name');
+    const constituencyGrouped = this._groupResults(constituencyRows.rows, 'constituency_id', 'constituency_name');
 
     return {
       election_id: parseInt(electionId),
@@ -464,11 +653,13 @@ class VoteService {
       eligible_students: eligibleCount,
       ballots_submitted: votedCount,
       participation_rate: Math.round(participationRate * 10) / 10,
-      total_candidates: totalCandidates,
-      total_clubs: Object.keys(clubs).length,
+      total_candidates: clubGrouped.totalCandidates + constituencyGrouped.totalCandidates,
+      total_clubs: clubGrouped.groups.length,
+      total_constituencies: constituencyGrouped.groups.length,
       results_published_at: election.rows[0].results_published_at,
       results_published: election.rows[0].results_published_at !== null,
-      clubs: Object.values(clubs),
+      clubs: clubGrouped.groups,
+      constituencies: constituencyGrouped.groups,
     };
   }
 

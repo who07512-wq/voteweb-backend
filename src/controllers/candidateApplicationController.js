@@ -15,12 +15,26 @@ class CandidateApplicationController {
       const studentId = req.user.studentId;
       const applicationData = req.body;
 
-      // Validate required fields
+      const category = String(applicationData.category || 'CLUB').trim().toUpperCase();
+      const isCR = category === 'CR' || category === 'CLASS_REPRESENTATIVE';
+      if (category !== 'CLUB' && category !== 'CR' && category !== 'CLASS_REPRESENTATIVE') {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid category.',
+        });
+      }
+
+      // Validate required fields. Cr applications additionally require a
+      // section so the constituency seat can be resolved at approval.
       const requiredFields = [
-        'fullName', 'enrollmentNumber', 'department', 'year',
-        'nominationClub', 'contestingPosition', 'email', 'phone', 'bio', 'manifesto',
-        'age', 'dateOfBirth', 'gender', 'aadharNumber'
+        'fullName', 'enrollmentNumber', 'department', 'year', 'email', 'phone',
+        'bio', 'manifesto', 'age', 'dateOfBirth', 'gender', 'aadharNumber'
       ];
+      if (isCR) {
+        requiredFields.push('section');
+      } else {
+        requiredFields.push('nominationClub', 'contestingPosition');
+      }
 
       for (const field of requiredFields) {
         if (!applicationData[field] || String(applicationData[field]).trim() === '') {
@@ -31,35 +45,41 @@ class CandidateApplicationController {
         }
       }
 
-      // Validate against the official club nomination form lists
-      const NOMINATION_CLUBS = [
-        'SAHITYASHALA (LITERATURE AND POETRY CLUB) & RACHNAKAR (CREATIVE CLUB)',
-        'BOSCO SPARTANS (SPORTS CLUB)',
-        'PUBLICATION COMMITTEE',
-        'ECO CLUB',
-        'TECHNO SPARKS (TECHNO CLUB)',
-        'AARAMBH (ENTREPRENEURSHIP CLUB)',
-        'SOCIAL SYNERGY (SOCIAL MEDIA CLUB)',
-        'SOCIAL OUTREACH (PARIVARTAN CLUB)',
-        'CO-CURRICULAR & EXTRA CO-CURRICULAR ACTIVITIES CLUB',
-        'JHANKAAR (CULTURAL CLUB)',
-      ];
-      const CONTESTING_POSITIONS = [
-        'Vice President (Batch 2020)',
-        'Secretary (Batch 2021)',
-      ];
+      if (isCR) {
+        // CR applicants own their department/year/section, so the assigned
+        // constituency at approval must match. Nothing else to validate here;
+        // the server re-validates identity at approval time.
+      } else {
+        // Validate against the official club nomination form lists
+        const NOMINATION_CLUBS = [
+          'SAHITYASHALA (LITERATURE AND POETRY CLUB) & RACHNAKAR (CREATIVE CLUB)',
+          'BOSCO SPARTANS (SPORTS CLUB)',
+          'PUBLICATION COMMITTEE',
+          'ECO CLUB',
+          'TECHNO SPARKS (TECHNO CLUB)',
+          'AARAMBH (ENTREPRENEURSHIP CLUB)',
+          'SOCIAL SYNERGY (SOCIAL MEDIA CLUB)',
+          'SOCIAL OUTREACH (PARIVARTAN CLUB)',
+          'CO-CURRICULAR & EXTRA CO-CURRICULAR ACTIVITIES CLUB',
+          'JHANKAAR (CULTURAL CLUB)',
+        ];
+        const CONTESTING_POSITIONS = [
+          'Vice President (Batch 2020)',
+          'Secretary (Batch 2021)',
+        ];
 
-      if (!NOMINATION_CLUBS.includes(String(applicationData.nominationClub).trim())) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid club selected.',
-        });
-      }
-      if (!CONTESTING_POSITIONS.includes(String(applicationData.contestingPosition).trim())) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid position selected.',
-        });
+        if (!NOMINATION_CLUBS.includes(String(applicationData.nominationClub).trim())) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid club selected.',
+          });
+        }
+        if (!CONTESTING_POSITIONS.includes(String(applicationData.contestingPosition).trim())) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid position selected.',
+          });
+        }
       }
 
       // Email validation
@@ -327,7 +347,7 @@ class CandidateApplicationController {
         });
       }
 
-      const updated = await candidateAppService.approve(id, adminId);
+      const updated = await candidateAppService.approve(id, adminId, req.body);
 
       return res.json({
         success: true,

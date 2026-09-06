@@ -25,17 +25,36 @@ class StudentService {
   /**
    * Find all students
    */
+  // Common projection that also pre-fills department/year/section from the
+  // student's most recent Class Representative application (preferred when the
+  // account has no section yet, so admins can mirror approved CR data).
+  static PREFILL_JOIN = `
+    LEFT JOIN LATERAL (
+      SELECT ca.department, ca.year, ca.section
+      FROM candidate_applications ca
+      WHERE ca.student_id = s.id
+        AND ca.category = 'CLASS_REPRESENTATIVE'
+      ORDER BY (ca.status = 'approved') DESC, ca.created_at DESC
+      LIMIT 1
+    ) app ON TRUE
+  `;
+
   async findAll(options = {}) {
     const { activeOnly = false, limit = 100, offset = 0 } = options;
 
-    let query = 'SELECT * FROM students';
+    let query = `SELECT s.*,
+                        app.department AS applied_department,
+                        app.year AS applied_year,
+                        app.section AS applied_section
+                   FROM students s
+                   ${StudentService.PREFILL_JOIN}`;
     const params = [];
 
     if (activeOnly) {
-      query += ' WHERE is_active = true';
+      query += ' WHERE s.is_active = true';
     }
 
-    query += ' ORDER BY id LIMIT $1 OFFSET $2';
+    query += ' ORDER BY s.id LIMIT $1 OFFSET $2';
     params.push(limit, offset);
 
     const result = await db.query(query, params);
@@ -47,7 +66,13 @@ class StudentService {
    */
   async findById(id) {
     const result = await db.query(
-      'SELECT * FROM students WHERE id = $1',
+      `SELECT s.*,
+              app.department AS applied_department,
+              app.year AS applied_year,
+              app.section AS applied_section
+         FROM students s
+         ${StudentService.PREFILL_JOIN}
+        WHERE s.id = $1`,
       [id]
     );
     return sanitizeStudent(result.rows[0]) || null;
@@ -84,7 +109,7 @@ class StudentService {
    * Update student
    */
   async update(id, data) {
-    const { name, email, voting_eligible, role } = data;
+    const { name, email, voting_eligible, role, department, year_or_semester, section } = data;
 
     // Build SET clauses dynamically so partial updates only touch given fields
     const sets = [];
@@ -106,6 +131,18 @@ class StudentService {
     if (role !== undefined) {
       sets.push(`role = $${idx++}`);
       values.push(role);
+    }
+    if (department !== undefined) {
+      sets.push(`department = $${idx++}`);
+      values.push(department);
+    }
+    if (year_or_semester !== undefined) {
+      sets.push(`year_or_semester = $${idx++}`);
+      values.push(year_or_semester);
+    }
+    if (section !== undefined) {
+      sets.push(`section = $${idx++}`);
+      values.push(section === null ? null : section);
     }
 
     if (sets.length === 0) {

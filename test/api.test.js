@@ -18,6 +18,7 @@ const announcementService = require('../src/services/announcementService');
 const { hashPassword } = require('../src/lib/password');
 const { TestClient, randomId } = require('./helpers');
 const { setupTestDatabase } = require('./setup');
+const constituencyService = require('../src/services/constituencyService');
 
 let server;
 let baseUrl;
@@ -321,6 +322,194 @@ test('unauthenticated admin route returns 401', async () => {
   const fresh = new TestClient(baseUrl);
   const res = await fresh.request('GET', '/api/v1/admin/students', { csrf: false, binding: false });
   assert.ok([401, 403].includes(res.status), `expected 401/403, got ${res.status}`);
+});
+
+// ============================================================
+// CLASS REPRESENTATIVE (CR) VOTING
+// ============================================================
+let crConstituencyId;
+let crPositionId;
+
+test('CR: my-constituency resolves the student seat from their profile', async () => {
+  // Create a 'BCA 2nd Year Section A' constituency in election 1 (auto-creates
+  // its own locked Class Representative position).
+  const constituency = await constituencyService.create({
+    electionId: 1,
+    department: 'BCA',
+    year: '2nd Year',
+    section: 'A',
+  });
+  crConstituencyId = constituency.id;
+  const pos = await db.query('SELECT id FROM positions WHERE constituency_id = $1', [crConstituencyId]);
+  assert.ok(pos.rows.length > 0, 'constituency must auto-create its CR position');
+  crPositionId = pos.rows[0].id;
+
+  // Authorize the attacker as an election-wide voter too, so the mismatch
+  // test reaches the eligibility check (not the earlier auth check).
+  await db.query(
+    `INSERT INTO voter_authorizations (student_id, election_id)
+     VALUES ($1, 1)
+     ON CONFLICT DO NOTHING`,
+    [attackerStudentId]
+  );
+
+  // Give the test student a matching section profile; attacker stays different.
+  await db.query(
+    `UPDATE students SET department = 'BCA', year_or_semester = '2nd Year', section = 'A' WHERE id = $1`,
+    [testStudentId]
+  );
+  await db.query(
+    `UPDATE students SET department = 'BCA', year_or_semester = '2nd Year', section = 'B' WHERE id = $1`,
+    [attackerStudentId]
+  );
+
+  const externalId = globalThis.__TEST_STUDENT_ID__;
+  const c = new TestClient(baseUrl);
+  await c.login(externalId, TEST_PW);
+
+  const res = await c.request('GET', '/api/v1/elections/1/votes/my-constituency', { csrf: false });
+  assert.equal(res.status, 200, JSON.stringify(res.json));
+  assert.equal(res.json.data.constituency.id, crConstituencyId);
+
+  // The attacker (different section) must resolve to nothing.
+  const attackerClient = new TestClient(baseUrl);
+  await attackerClient.login(globalThis.__ATTACKER_STUDENT_ID__, TEST_PW);
+  const attacked = await attackerClient.request('GET', '/api/v1/elections/1/votes/my-constituency', { csrf: false });
+  assert.equal(attacked.status, 200);
+  assert.equal(attacked.json.data.constituency, null);
+});
+
+test('CR: student votes for their own constituency seat', async () => {
+  await db.query(
+    `INSERT INTO candidates (position_id, name, description, display_order, is_active)
+     VALUES ($1, 'CR Candidate Alpha', 'Running for Class Representative', 1, TRUE)`,
+    [crPositionId]
+  );
+  const candidate = await db.query(
+    'SELECT id FROM candidates WHERE position_id = $1 ORDER BY id LIMIT 1',
+    [crPositionId]
+  );
+  const candidateId = candidate.rows[0].id;
+
+  const externalId = globalThis.__TEST_STUDENT_ID__;
+  const c = new TestClient(baseUrl);
+  await c.login(externalId, TEST_PW);
+
+  const res = await c.request('POST', '/api/v1/elections/1/votes', {
+    body: { election_id: 1, constituency_id: crConstituencyId, position_id: crPositionId, candidate_id: candidateId },
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.json));
+  assert.equal(res.json.data.success, true);
+  assert.ok(res.json.data.receipt.receiptHash);
+
+  const row = await db.query('SELECT constituency_id FROM votes WHERE position_id = $1 AND student_id = $2', [crPositionId, testStudentId]);
+  assert.equal(row.rows[0].constituency_id, crConstituencyId);
+});
+
+test('CR: supplying club_id for a CR seat is rejected', async () => {
+  const externalId = globalThis.__TEST_STUDENT_ID__;
+  const c = new TestClient(baseUrl);
+  await c.login(externalId, TEST_PW);
+  const res = await c.request('POST', '/api/v1/elections/1/votes', {
+    body: { election_id: 1, club_id: 1, position_id: crPositionId, candidate_id: 1 },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.json.code, 'INVALID_BALLOT_SCOPE');
+});
+
+test('CR: student from another section cannot vote in the constituency', async () => {
+  // Fresh CR student from the wrong section; must reach CONSTITUENCY_MISMATCH.
+  const wrongExternal = `WRG${randomId('')}`.slice(0, 18);
+  const hash = await hashPassword(TEST_PW);
+  const wrong = await db.query(
+    `INSERT INTO students (external_id, name, email, role, password_hash, password_change_required,
+                           department, year_or_semester, section, is_active)
+     VALUES ($1, 'Wrong Section', $2, 'STUDENT', $3, FALSE, 'BCA', '2nd Year', 'C', TRUE)
+     RETURNING id`,
+    [wrongExternal, `${wrongExternal}@test.local`, hash]
+  );
+  const wrongStudentId = wrong.rows[0].id;
+  await db.query(
+    `INSERT INTO voter_authorizations (student_id, election_id) VALUES ($1, 1)`,
+    [wrongStudentId]
+  );
+
+  try {
+    const c = new TestClient(baseUrl);
+    await c.login(wrongExternal, TEST_PW);
+    const res = await c.request('POST', '/api/v1/elections/1/votes', {
+      body: { election_id: 1, constituency_id: crConstituencyId, position_id: crPositionId, candidate_id: 1 },
+    });
+    assert.equal(res.status, 403, JSON.stringify(res.json));
+    assert.equal(res.json.code, 'CONSTITUENCY_MISMATCH');
+  } finally {
+    await db.query('DELETE FROM voter_authorizations WHERE student_id = $1', [wrongStudentId]);
+    await db.query('DELETE FROM students WHERE id = $1', [wrongStudentId]);
+  }
+});
+
+test('CR: fixtures are cleaned up for subsequent runs', async () => {
+  await db.query('DELETE FROM vote_receipts WHERE vote_id IN (SELECT id FROM votes WHERE position_id = $1)', [crPositionId]);
+  await db.query('DELETE FROM votes WHERE position_id = $1', [crPositionId]);
+  await db.query('DELETE FROM candidates WHERE position_id = $1', [crPositionId]);
+  await db.query('DELETE FROM positions WHERE id = $1', [crPositionId]);
+  await db.query('DELETE FROM constituencies WHERE id = $1', [crConstituencyId]);
+  await db.query('DELETE FROM voter_authorizations WHERE student_id = $1', [attackerStudentId]);
+});
+
+test('admin section edit: department/year/section persist via studentService', async () => {
+  const studentService = require('../src/services/studentService');
+  const updated = await studentService.update(testStudentId, {
+    department: 'BCA',
+    year_or_semester: '2nd Year',
+    section: 'A',
+  });
+  assert.equal(updated.department, 'BCA');
+  assert.equal(updated.year_or_semester, '2nd Year');
+  assert.equal(updated.section, 'A');
+
+  // Clearing section is allowed (returns to application pre-fill).
+  const cleared = await studentService.update(testStudentId, { section: null });
+  assert.equal(cleared.section, null);
+});
+
+test('admin section edit: candidates expose their CR application as pre-fill', async () => {
+  const studentService = require('../src/services/studentService');
+  const me = await db.query('SELECT name, email FROM students WHERE id = $1', [testStudentId]);
+
+  // Throwaway constituency so the application has a real CR position to point at.
+  const constituency = await constituencyService.create({
+    electionId: 1,
+    department: 'MBA',
+    year: '2nd Year',
+    section: 'C',
+  });
+  const pos = await db.query('SELECT id FROM positions WHERE constituency_id = $1', [constituency.id]);
+
+  await db.query(
+    `INSERT INTO candidate_applications
+       (student_id, full_name, enrollment_number, department, year, section, position_id, email, phone, status, category)
+     VALUES ($1, $2, $3, 'MBA', '2nd Year', 'C', $4, $5, '0000000000', 'approved', 'CLASS_REPRESENTATIVE')`,
+    [testStudentId, me.rows[0].name, `ENROLL_${randomId('')}`, pos.rows[0].id, me.rows[0].email]
+  );
+  try {
+    const found = await studentService.findById(testStudentId);
+    assert.equal(found.applied_department, 'MBA');
+    assert.equal(found.applied_year, '2nd Year');
+    assert.equal(found.applied_section, 'C');
+    assert.equal(found.section, null);
+  } finally {
+    await db.query(
+      'DELETE FROM candidate_applications WHERE student_id = $1 AND category = $2',
+      [testStudentId, 'CLASS_REPRESENTATIVE']
+    );
+    await db.query('DELETE FROM positions WHERE id = $1', [pos.rows[0].id]);
+    await db.query('DELETE FROM constituencies WHERE id = $1', [constituency.id]);
+    await db.query(
+      `UPDATE students SET department = NULL, year_or_semester = NULL, section = NULL WHERE id = $1`,
+      [testStudentId]
+    );
+  }
 });
 
 // ============================================================
