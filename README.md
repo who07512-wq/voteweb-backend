@@ -208,6 +208,8 @@ Mounts are defined in `src/app.js`. Read-access rows (elections, positions, club
 | `/api/v1/notifications`, `/api/v1/support` | `notifications.js`, `support.js` | Authenticated user features |
 | `/api/v1/cad` | `cad.js` | CAD (election monitor) |
 | `/api/v1/admin/*` (each) | `admin*.js` | All behind `requireAdmin` — students, elections, clubs, positions, candidates, candidate-applications, authorizations, announcements, support, email-recovery, access-requests, stats, audit-logs, readiness |
+| `/api/v1/admin/stats` | `adminStats.js` | Static dashboard stats (`GET`, `requireAdmin`) |
+| `/api/v1/admin/live` | `adminLiveResults.js` | **Real-time** dashboard snapshot (`GET /live`, `requireAdmin`) — `{ stats, leaderboard, generatedAt }`. Stats mirror the admin-stats queries; `leaderboard` is the top 10 active candidates by vote count across all active elections (JOINs candidates → positions → clubs/constituencies → elections → votes). Powers the admin dashboard's live polling (4s) and results chart. |
 
 **Known audit findings (fixed / open):**
 - ✅ Fixed: all `/api/debug/*` endpoints production-guarded (commits `705b0b1`, `6d81037`).
