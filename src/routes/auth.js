@@ -1725,7 +1725,7 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 // =====================================================
 router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res) => {
   try {
-    const { rollNumber, fullName, role } = req.body;
+    const { rollNumber, fullName, role, mobileNumber, password } = req.body;
 
     // Role: STUDENT (default) or CANDIDATE (registers a student account for
     // the candidate application flow). CAD is no longer registrable and
@@ -1784,8 +1784,24 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
     // Registration name IS the account name — it pre-fills the candidate
     // application form and shows on dashboards/profile.
 
-    // ---- 4. Create the account (passwordless) ----
+    // ---- Password (required; used for email + password sign-in) ----
+    if (!password || typeof password !== 'string') {
+      return authError(res, 400, 'INVALID_PASSWORD', 'Please choose a password (at least 12 characters).');
+    }
+    const passwordPolicyError = validatePasswordPolicy(password, email.split('@')[0]);
+    if (passwordPolicyError) {
+      return authError(res, 400, 'INVALID_PASSWORD', passwordPolicyError);
+    }
+
+    // ---- Phone / mobile number (required) ----
+    const phone = String(mobileNumber || '').replace(/[\s()-]/g, '');
+    if (!phone || !/^\+?[0-9]{10,15}$/.test(phone)) {
+      return authError(res, 400, 'INVALID_PHONE', 'Please enter a valid phone number (10-15 digits).');
+    }
+
+    // ---- 4. Create the account (Clerk user keeps the password too) ----
     const identifier = email.split('@')[0];
+    const passwordHash = await hashPassword(password);
     let account;
 
     // Duplicate roll number → the roll number IS the student identity.
@@ -1802,10 +1818,10 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
 
     const inserted = await db.query(
       `INSERT INTO students (external_id, name, email, current_login_email, password_hash,
-                             roll_number, role, is_active, email_verified, username)
-       VALUES ($1, $2, $3, $3, NULL, NULLIF($4, ''), $5, TRUE, TRUE, $6)
+                             roll_number, mobile_number, role, is_active, email_verified, username)
+       VALUES ($1, $2, $3, $3, $4, NULLIF($5, ''), $6, $7, TRUE, TRUE, $8)
        RETURNING *`,
-      [`REG-${Date.now()}`, name, email, roll, storedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
+      [`REG-${Date.now()}`, name, email, passwordHash, roll, phone, storedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
     ).then((r) => r.rows[0]);
     account = inserted;
 
