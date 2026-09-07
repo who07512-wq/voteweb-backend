@@ -63,6 +63,52 @@ class StudentController {
   }
 
   /**
+   * GET /api/v1/students/profile
+   * Authenticated — the caller's own student record. Identity always comes
+   * from the session (req.user.studentId), never from the client.
+   */
+  async profile(req, res, next) {
+    try {
+      const studentId = req.user?.studentId;
+      if (!studentId) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      const student = await studentService.findById(studentId);
+
+      if (!student) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Student record not found.',
+        });
+      }
+
+      res.json({
+        data: {
+          id: String(student.id),
+          name: student.name,
+          email: student.email || student.official_email || student.current_login_email || null,
+          enrollmentNumber: student.roll_number || student.enrollment_number || null,
+          department: student.department || null,
+          year: student.year_or_semester || null,
+          section: student.section || null,
+          phone: student.mobile_number || null,
+          avatar: null,
+          role: student.role,
+          isActive: !!student.is_active,
+          votingEligible: !!student.voting_eligible,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * GET /api/v1/students/by-external-id/:externalId
    */
   async getByExternalId(req, res, next) {

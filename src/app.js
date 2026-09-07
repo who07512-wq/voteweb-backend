@@ -24,6 +24,7 @@ const adminAuditLogs = require('./controllers/adminAuditLogs');
 const clubController = require('./controllers/clubController');
 const positionController = require('./controllers/positionController');
 const candidateController = require('./controllers/candidateController');
+const studentController = require('./controllers/studentController');
 const authController = require('./controllers/authorizationController');
 const voteController = require('./controllers/voteController');
 const adminStudents = require('./routes/adminStudents');
@@ -41,6 +42,7 @@ const receiptRoutes = require('./routes/receipts');
 const notificationRoutes = require('./routes/notifications');
 const supportRoutes = require('./routes/support');
 const { loadSession } = require('./middleware/loadSession');
+const { requireAuth } = require('./middleware/requireAuth');
 const { requireAdmin } = require('./middleware/requireAdmin');
 
 const app = express();
@@ -368,6 +370,9 @@ app.use('/api/v1/notifications', notificationRoutes);
 
 // Support requests (authenticated)
 app.use('/api/v1/support', supportRoutes);
+
+// Authenticated student's own profile (identity from session, never client-supplied)
+app.get('/api/v1/students/profile', requireAuth, studentController.profile.bind(studentController));
 
 // =====================================================
 // ADMIN ROUTES (authentication + admin role required)

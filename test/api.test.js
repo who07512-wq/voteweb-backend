@@ -546,11 +546,30 @@ test('notifications list is accessible for authenticated user', async () => {
 });
 
 test('POST /mark-all-read requires binding + csrf', async () => {
-  const c = new TestClient(baseUrl);
-  await c.login('STU001', 'StudentPassword123!');
-  const res = await c.request('POST', '/api/v1/notifications/mark-all-read');
-  assert.ok([200, 204, 404].includes(res.status), `got ${res.status}`);
-});
+   const c = new TestClient(baseUrl);
+   await c.login('STU001', 'StudentPassword123!');
+   const res = await c.request('POST', '/api/v1/notifications/mark-all-read');
+   assert.ok([200, 204, 404].includes(res.status), `got ${res.status}`);
+ });
+
+ // ============================================================
+ // STUDENT PROFILE (authenticated, own record only)
+ // ============================================================
+ test('GET /api/v1/students/profile returns the caller\x27s own record', async () => {
+   const c = new TestClient(baseUrl);
+   await c.login('STU001', 'StudentPassword123!');
+   const res = await c.request('GET', '/api/v1/students/profile', { csrf: false });
+   assert.equal(res.status, 200, `got ${res.status}`);
+   const data = res.json.data;
+   assert.ok(data.id);
+   assert.equal(data.name, 'Student One');
+ });
+
+ test('GET /api/v1/students/profile rejects unauthenticated access', async () => {
+   const c = new TestClient(baseUrl);
+   const res = await c.request('GET', '/api/v1/students/profile', { csrf: false });
+   assert.equal(res.status, 401);
+ });
 
 // ============================================================
 // ANNOUNCEMENT → NOTIFICATIONS
