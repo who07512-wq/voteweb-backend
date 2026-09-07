@@ -1708,13 +1708,14 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 });
 
 // =====================================================
-// CLERK-PROOF REGISTRATION (email → OTP code → set password + roll number)
+// CLERK-PROOF REGISTRATION (email → OTP code → name + roll number)
 //
 // The frontend collects the email, completes a Clerk email-code challenge
 // (Clerk sends the OTP email), then calls this endpoint with the Clerk
 // session token as a Bearer token to prove email ownership. We resolve the
-// email server-side, create the account with a real password + roll number,
-// and return a backend session (cv_sid cookie).
+// email server-side, create the account (no password — sign-in is always via
+// a one-time code) with name + roll number, and return a backend session
+// (cv_sid cookie).
 //
 // Roles: registration creates a STUDENT account used to apply as a
 // candidate (CANDIDATE is earned when an admin approves the application).
@@ -1724,14 +1725,7 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 // =====================================================
 router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res) => {
   try {
-    const { password, confirmPassword, rollNumber, fullName, role } = req.body;
-
-    if (!password || !confirmPassword) {
-      return authError(res, 400, 'INVALID_INPUT', 'Password and confirmation are required.');
-    }
-    if (password !== confirmPassword) {
-      return authError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match.');
-    }
+    const { rollNumber, fullName, role } = req.body;
 
     // Role: STUDENT (default) or CANDIDATE (registers a student account for
     // the candidate application flow). CAD is no longer registrable and
@@ -1758,7 +1752,7 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
     }
     const email = verified.email;
 
-    // ---- 2. Existing account with a password? Point them at login ----
+    // ---- 2. Existing account? Point them at sign-in ----
     const existing = await db.query(
       `SELECT id, role, password_hash FROM students
         WHERE LOWER(current_login_email) = LOWER($1) OR LOWER(email) = LOWER($1)
@@ -1766,18 +1760,12 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
       [email]
     ).then((r) => r.rows[0]);
 
-    if (existing && existing.password_hash) {
+    if (existing) {
       return authError(res, 409, 'EMAIL_EXISTS',
-        'An account with this email already exists. Please sign in with your email and password.');
+        'An account with this email already exists. Please sign in with the one-time code sent to your email.');
     }
 
-    // ---- 3. Validate password policy + roll number ----
-    const identifier = email.split('@')[0];
-    const passwordError = validatePasswordPolicy(password, identifier);
-    if (passwordError) {
-      return authError(res, 400, 'WEAK_PASSWORD', passwordError);
-    }
-
+    // ---- 3. Validate roll number + name ----
     // Roll number is required for direct student registration, optional when
     // registering through the candidate portal (the application form collects
     // the enrollment number anyway).
@@ -1795,51 +1783,31 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
     }
     // Registration name IS the account name — it pre-fills the candidate
     // application form and shows on dashboards/profile.
-    void identifier;
 
-    // ---- 4. Create (or upgrade) the account ----
-    const passwordHash = await hashPassword(password);
+    // ---- 4. Create the account (passwordless) ----
+    const identifier = email.split('@')[0];
     let account;
 
-    if (existing) {
-      // Clerk bridge created a passwordless account earlier — set the
-      // password + roll number and treat this as completion. Roles are never
-      // changed here (candidacy is earned via application approval).
-      const updated = await db.query(
-        `UPDATE students
-            SET password_hash = $1,
-                roll_number = COALESCE(roll_number, NULLIF($2, '')),
-                external_id = CASE WHEN external_id LIKE 'CLERK-%' THEN $3 ELSE external_id END,
-                role = $4,
-                email_verified = TRUE,
-                updated_at = NOW()
-          WHERE id = $5
-          RETURNING *`,
-        [passwordHash, roll, `REG-${Date.now()}`, existing.role, existing.id]
+    // Duplicate roll number → the roll number IS the student identity.
+    if (roll) {
+      const dupRoll = await db.query(
+        'SELECT id FROM students WHERE LOWER(roll_number) = LOWER($1) LIMIT 1',
+        [roll]
       ).then((r) => r.rows[0]);
-      account = updated;
-    } else {
-      // Duplicate roll number → the roll number IS the student identity.
-      if (roll) {
-        const dupRoll = await db.query(
-          'SELECT id FROM students WHERE LOWER(roll_number) = LOWER($1) LIMIT 1',
-          [roll]
-        ).then((r) => r.rows[0]);
-        if (dupRoll) {
-          return authError(res, 409, 'ROLL_EXISTS',
-            'This roll number is already registered. If it is yours, sign in instead or contact the administrator.');
-        }
+      if (dupRoll) {
+        return authError(res, 409, 'ROLL_EXISTS',
+          'This roll number is already registered. If it is yours, sign in instead or contact the administrator.');
       }
-
-      const inserted = await db.query(
-        `INSERT INTO students (external_id, name, email, current_login_email, password_hash,
-                               roll_number, role, is_active, email_verified, username)
-         VALUES ($1, $2, $3, $3, $4, NULLIF($5, ''), $6, TRUE, TRUE, $7)
-         RETURNING *`,
-        [`REG-${Date.now()}`, name, email, passwordHash, roll, storedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
-      ).then((r) => r.rows[0]);
-      account = inserted;
     }
+
+    const inserted = await db.query(
+      `INSERT INTO students (external_id, name, email, current_login_email, password_hash,
+                             roll_number, role, is_active, email_verified, username)
+       VALUES ($1, $2, $3, $3, NULL, NULLIF($4, ''), $5, TRUE, TRUE, $6)
+       RETURNING *`,
+      [`REG-${Date.now()}`, name, email, roll, storedRole, `${identifier.replace(/[^a-z0-9._-]/gi, '').toLowerCase() || 'user'}.${Date.now().toString(36).slice(-4)}`]
+    ).then((r) => r.rows[0]);
+    account = inserted;
 
     // ---- 5. Session ----
     const bindingToken = await createSession(res, account.id, false);
@@ -1864,23 +1832,16 @@ router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res)
 });
 
 // =====================================================
-// CLERK-PROOF FORGOT PASSWORD (email → OTP code → set new password)
+// CLERK-PROOF EMAIL RECOVERY (email → OTP code → session)
 //
-// Same email-ownership proof as registration, but for accounts that already
-// exist. The account must have a password (Clerk-bridge accounts without one
-// are told to register instead).
+// Same email-ownership proof as registration, for accounts that already
+// exist. Accounts have no password in the OTP flow, so there is nothing to
+// reset: a verified email yields a fresh session directly. Kept behind the
+// same endpoint name so older clients that still POST here never receive a
+// password-change response.
 // =====================================================
 router.post('/forgot-password/clerk', passwordResetLimiter, csrfProtection, async (req, res) => {
   try {
-    const { newPassword, confirmNewPassword } = req.body;
-
-    if (!newPassword || !confirmNewPassword) {
-      return authError(res, 400, 'INVALID_INPUT', 'New password and confirmation are required.');
-    }
-    if (newPassword !== confirmNewPassword) {
-      return authError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match.');
-    }
-
     // ---- 1. Prove email ownership via the Clerk session token ----
     let verified;
     try {
@@ -1909,28 +1870,10 @@ router.post('/forgot-password/clerk', passwordResetLimiter, csrfProtection, asyn
         'No account exists for this email. Please register first.');
     }
 
-    // ---- 3. Validate + set the new password ----
-    const identifier = email.split('@')[0];
-    const passwordError = validatePasswordPolicy(newPassword, identifier);
-    if (passwordError) {
-      return authError(res, 400, 'WEAK_PASSWORD', passwordError);
-    }
-
-    const passwordHash = await hashPassword(newPassword);
-    await db.query(
-      'UPDATE students SET password_hash = $1, password_change_required = FALSE, failed_login_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $2',
-      [passwordHash, account.id]
-    );
-
-    // Invalidate every existing session (they were issued under the old
-    // credential) and issue a fresh one.
-    await db.query(
-      'UPDATE sessions SET revoked_at = NOW() WHERE student_id = $1 AND revoked_at IS NULL',
-      [account.id]
-    );
+    // ---- 3. Authenticate the verified email (no password exists to reset) ----
     const bindingToken = await createSession(res, account.id, false);
 
-    await recordAudit('password_reset_completed', {
+    await recordAudit('email_recovery_signin', {
       studentId: account.id,
       ip: req.ip,
       metadata: { method: 'clerk_email_code' },
@@ -1944,8 +1887,8 @@ router.post('/forgot-password/clerk', passwordResetLimiter, csrfProtection, asyn
       },
     });
   } catch (error) {
-    console.error('Clerk forgot password error:', error);
-    return authError(res, 500, 'INTERNAL_ERROR', 'An error occurred resetting the password.');
+    console.error('Clerk email recovery error:', error);
+    return authError(res, 500, 'INTERNAL_ERROR', 'An error occurred during recovery sign-in.');
   }
 });
 
