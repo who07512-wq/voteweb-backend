@@ -24,16 +24,13 @@ function cookieOptions(httpOnly, crossSite = false) {
     maxAge: httpOnly ? config.sessionTtlMs : 60 * 60 * 1000, // 1 hour for CSRF
   };
 
-  // For cross-site cookies (CSRF tokens), we need SameSite=None and Secure=true
-  // SameSite=None is required for cookies to be sent cross-origin (Vercel → Railway)
-  // Secure=true is REQUIRED when SameSite=None (browsers enforce this)
-  if (crossSite) {
-    options.sameSite = 'none';
-    options.secure = true; // Always require HTTPS for SameSite=None
-  } else {
-    options.sameSite = config.cookieSameSite;
-    options.secure = config.cookieSecure;
-  }
+  // The frontend proxies every /api call through Next.js rewrites, so the
+  // browser only ever talks to the frontend origin. That makes the CSRF and
+  // session cookies first-party, and SameSite=Lax + Secure is the most
+  // iOS/ITP-compatible configuration. Keep an opt-out env to allow
+  // SameSite=None for a non-proxied deployment (COOKIE_SAMESITE=none).
+  options.sameSite = config.cookieSameSite;
+  options.secure = config.cookieSecure;
 
   return options;
 }
@@ -46,8 +43,10 @@ function cookieOptions(httpOnly, crossSite = false) {
 function mintCsrfToken(res) {
   const token = randomBytes(32).toString('base64url');
   // Set HttpOnly: false so JS can read it for the header
-  // crossSite: true because CSRF cookie needs to work cross-site (Vercel → Railway)
-  res.cookie(CSRF_COOKIE, token, cookieOptions(false, true));
+  // The cookie is first-party: the frontend proxies /api, so the browser sees
+  // it as SameSite=Lax + Secure (see cookieOptions). COOKIE_SAMESITE=none
+  // restores the old cross-site behavior if ever needed.
+  res.cookie(CSRF_COOKIE, token, cookieOptions(false));
   return token;
 }
 
