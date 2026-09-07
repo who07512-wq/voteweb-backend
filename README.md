@@ -185,6 +185,26 @@ The schema is applied by `npm run migrate` (`node migrate.js up`). Migrations (i
 - **Vote integrity:** `votes` row UNIQUE(student_id, election_id, position_id) guarantees one vote per position at the DB level.
 - **Rate limiting:** login, OTP, register, password-reset, and MFA endpoints are rate-limited (`rateLimiter.js`).
 
+## Monitoring (Prometheus + Grafana)
+
+The backend exposes Prometheus-compatible metrics on **`GET /metrics`**
+(`prom-client`). Metrics are aggregate-only — no student names, emails, roll
+numbers, IPs, sessions, tokens or candidate selections are exported.
+
+- **Vote counter** increments only after a successful vote INSERT; **login
+  counters** increment on every login attempt / failure. All increments are
+  guarded so a monitoring failure can never break voting or login.
+- **`GET /metrics`** requires `Authorization: Bearer <METRICS_TOKEN>` (env,
+  ≥16 chars, timing-safe comparison). If `METRICS_TOKEN` is unset:
+  production → 403 (disabled), non-production → open (dev only).
+- **`GET /api/v1/admin/monitoring`** (`requireAdmin`) returns the aggregate
+  summary consumed by the `/admin/monitoring` page.
+- Configuration, Grafana dashboard + provisioning, and a local docker runbook
+  live in [`monitoring/`](./monitoring/README.md).
+
+Default-collector Node metrics (process CPU/memory, heap, event-loop lag) plus
+`campusvote_*` metrics are listed in `monitoring/README.md`.
+
 ## API route map
 
 Mounts are defined in `src/app.js`. Read-access rows (elections, positions, clubs, candidates, announcements, receipts) are public by design; everything sensitive is behind `requireAuth` / `requireAdmin`.
@@ -192,6 +212,7 @@ Mounts are defined in `src/app.js`. Read-access rows (elections, positions, club
 | Mount | Router file | Notable endpoints |
 |---|---|---|
 | `/api/health`, `/api/health/db`, `/api/health/brevo` | `app.js` inline | Liveness checks |
+| `/metrics`, `/api/v1/admin/monitoring` | `app.js` inline + `monitoring/metrics.js` | Prometheus scrape (Bearer `METRICS_TOKEN`) / admin aggregate summary |
 | `/api/v1/auth` | `auth.js` | `GET /csrf`, `GET /me`, `POST /login`, `POST /admin-portal-login`, `POST /logout`, OTP login/reset (`/otp/send-login`, `/otp/verify-login`, `/otp/send-reset`, …), `/mfa/setup` ⁄ `/mfa/verify` ⁄ `/mfa/verify-setup`, `/change-password`, `POST /register`, `/register/instant`, `/register/clerk`, `/forgot-password/clerk` |
 | `/api/v1/auth` | `clerkAuth.js` | `POST /clerk-session` (Clerk JWT → backend session) |
 | `/api/v1/auth` | `emailRecovery.js` | Email-recovery endpoints |

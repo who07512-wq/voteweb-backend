@@ -45,6 +45,7 @@ const supportRoutes = require('./routes/support');
 const { loadSession } = require('./middleware/loadSession');
 const { requireAuth } = require('./middleware/requireAuth');
 const { requireAdmin } = require('./middleware/requireAdmin');
+const { httpMetricsMiddleware, metricsHandler, buildMonitoringSummary } = require('./monitoring/metrics');
 
 const app = express();
 const isDev = process.env.NODE_ENV !== 'production';
@@ -109,6 +110,15 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // Cookie parsing
 app.use(cookieParser());
+
+// =====================================================
+// PROMETHEUS HTTP METRICS (observability — additive only)
+// Measures every request except the /metrics scrape itself.
+// =====================================================
+app.use(httpMetricsMiddleware);
+
+// Prometheus scrape endpoint (bearer-token protected; see monitoring/metrics.js)
+app.get('/metrics', metricsHandler);
 
 // =====================================================
 // SESSION LOADING (runs on every request before route handlers)
@@ -395,6 +405,22 @@ app.use('/api/v1/admin/access-requests', requireAdmin, adminAccessRequestRoutes)
 app.use('/api/v1/admin/stats', requireAdmin, adminStats.getStats);
 app.get('/api/v1/admin/live', requireAdmin, adminLiveResults.getLive);
 app.get('/api/v1/admin/audit-logs', requireAdmin, adminAuditLogs.list);
+
+// System monitoring summary for the admin portal (aggregate, admin-only).
+// Not a Prometheus scrape — the /metrics endpoint stays token-protected.
+app.get('/api/v1/admin/monitoring', requireAdmin, async (req, res) => {
+  try {
+    const summary = await buildMonitoringSummary();
+    res.json({ data: summary });
+  } catch (err) {
+    console.error('admin monitoring failed:', err.message);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Could not load monitoring summary.',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
 
 // Admin authorization management
 app.get('/api/v1/admin/elections/:electionId/authorizations', requireAdmin, authController.list.bind(authController));

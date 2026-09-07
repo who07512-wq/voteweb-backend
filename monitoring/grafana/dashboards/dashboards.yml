@@ -1,0 +1,17 @@
+# Grafana dashboard provisioning for CampusVote.
+#
+# Loads every dashboard JSON file from ./dashboard-defs into the
+# Prometheus datasource defined in datasources/datasource.yml.
+
+apiVersion: 1
+
+providers:
+  - name: campusvote
+    orgId: 1
+    folder: CampusVote
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 60
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

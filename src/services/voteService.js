@@ -6,6 +6,7 @@
 
 const db = require('../db');
 const crypto = require('crypto');
+const { incVotesCast } = require('../monitoring/metrics');
 
 class VoteService {
   /**
@@ -361,6 +362,7 @@ class VoteService {
 
     // Step 11: Generate vote receipt
     const vote = voteResult.rows[0];
+    incVotesCast();
     const receipt = await this.generateReceipt(vote.id, vote.election_id, vote.student_id);
 
     return {

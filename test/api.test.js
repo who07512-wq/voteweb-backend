@@ -19,6 +19,7 @@ const { hashPassword } = require('../src/lib/password');
 const { TestClient, randomId } = require('./helpers');
 const { setupTestDatabase } = require('./setup');
 const constituencyService = require('../src/services/constituencyService');
+const { createSession } = require('../src/services/sessionService');
 
 let server;
 let baseUrl;
@@ -661,4 +662,106 @@ test('admin-only announcement does not notify candidates', async () => {
     [testStudentId, attackerStudentId]
   );
   assert.equal(parseInt(notifs.rows[0].count), 0);
+});
+
+// ============================================================
+// MONITORING (Prometheus /metrics + admin monitoring summary)
+// ============================================================
+
+const VER = '0123456789abcdef0123456789abcdef0123456789abcdef';
+
+/** Mint a real ADMIN session (id 501) by calling createSession directly. */
+async function mintAdminSession() {
+  let rawToken = null;
+  await createSession({ cookie: (name, value) => { rawToken = value; } }, 501, true);
+  assert.ok(rawToken, 'session token not captured');
+  return rawToken;
+}
+
+test('GET /metrics without token returns 401 when METRICS_TOKEN is set', async () => {
+  process.env.METRICS_TOKEN = VER;
+  try {
+    const res = await client.request('GET', '/metrics', { csrf: false, binding: false });
+    assert.equal(res.status, 401);
+  } finally {
+    delete process.env.METRICS_TOKEN;
+  }
+});
+
+test('GET /metrics with wrong token returns 401', async () => {
+  process.env.METRICS_TOKEN = VER;
+  try {
+    const res = await client.request('GET', '/metrics', {
+      csrf: false,
+      binding: false,
+      headers: { Authorization: 'Bearer wrong-token-here' },
+    });
+    assert.equal(res.status, 401);
+  } finally {
+    delete process.env.METRICS_TOKEN;
+  }
+});
+
+test('GET /metrics with valid token returns exposition text', async () => {
+  process.env.METRICS_TOKEN = VER;
+  try {
+    const res = await fetch(`${baseUrl}/metrics`, {
+      headers: { Authorization: `Bearer ${VER}` },
+    });
+    assert.equal(res.status, 200);
+    const ct = res.headers.get('content-type') || '';
+    assert.ok(ct.includes('text/plain'), `unexpected content-type ${ct}`);
+    const body = await res.text();
+    assert.ok(body.includes('campusvote_http_requests_total'), 'missing http requests metric');
+    assert.ok(body.includes('campusvote_votes_cast_total'), 'missing votes cast metric');
+  } finally {
+    delete process.env.METRICS_TOKEN;
+  }
+});
+
+test('GET /metrics with no token is open in non-production and closed in production', async () => {
+  // Non-production (test): open access.
+  let res = await client.request('GET', '/metrics', { csrf: false, binding: false });
+  assert.equal(res.status, 200);
+
+  // Production without token: deliberately disabled (403).
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    res = await client.request('GET', '/metrics', { csrf: false, binding: false });
+    assert.equal(res.status, 403);
+  } finally {
+    process.env.NODE_ENV = prev;
+  }
+});
+
+test('GET /api/v1/admin/monitoring is forbidden for unauthenticated and student callers', async () => {
+  const fresh = new TestClient(baseUrl);
+  const unauth = await fresh.request('GET', '/api/v1/admin/monitoring', { csrf: false, binding: false });
+  assert.ok([401, 403].includes(unauth.status), `expected 401/403, got ${unauth.status}`);
+
+  const student = new TestClient(baseUrl);
+  await student.login('STU001', 'StudentPassword123!');
+  const denied = await student.request('GET', '/api/v1/admin/monitoring', { csrf: false });
+  assert.ok([401, 403].includes(denied.status), `expected 401/403, got ${denied.status}`);
+});
+
+test('GET /api/v1/admin/monitoring returns aggregate summary for a minted admin session', async () => {
+  const rawToken = await mintAdminSession();
+  const admin = new TestClient(baseUrl);
+  const res = await admin.request('GET', '/api/v1/admin/monitoring', {
+    csrf: false,
+    binding: false,
+    headers: { Cookie: `cv_sid=${rawToken}` },
+  });
+  assert.equal(res.status, 200);
+  const data = res.json.data;
+  assert.ok(data.status && ['healthy', 'degraded'].includes(data.status), `unexpected status ${data.status}`);
+  assert.ok(data.process.cpuPercent === null || typeof data.process.cpuPercent === 'number');
+  assert.equal(typeof data.http.requestsTotal, 'number');
+  assert.equal(typeof data.http.requestsPerSecond, 'number');
+  assert.equal(typeof data.database.connected, 'boolean');
+  assert.equal(typeof data.business.activeElections, 'number');
+  assert.equal(typeof data.business.votesCast, 'number');
+  assert.equal(typeof data.business.loginAttempts, 'number');
 });

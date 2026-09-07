@@ -21,6 +21,7 @@ const { createOtpChallenge, findValidChallenge, verifyOtpChallenge, checkRateLim
 const { sendLoginOtp, sendPasswordResetOtp } = require('../services/brevoService');
 const { recordAudit, findStudentByIdentifierOrEmail, publicUser, isLocked, incrementFailedLogin, updateStudentLogin } = require('../lib/authDb');
 const { verifyClerkSessionToken } = require('../lib/clerkVerify');
+const { incLoginAttempt, incFailedLogin } = require('../monitoring/metrics');
 
 // Helper for consistent error responses
 function authError(res, status, code, message) {
@@ -69,6 +70,7 @@ router.get('/me', loadSession, (req, res) => {
 // =====================================================
 router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
   try {
+    incLoginAttempt();
     const { userIdentifier, password, role } = req.body;
 
     // Validate input
@@ -93,6 +95,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
 
     // Check if account exists
     if (!account) {
+      incFailedLogin();
       await recordAudit('login_failed', {
         ip: req.ip,
         metadata: { identifier: userIdentifier, role: requestedRole, reason: 'account_not_found' },
@@ -104,6 +107,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
     // When role is omitted (main portal), any DB role is accepted — the
     // frontend routes to the dashboard matching the returned DB role.
     if (requestedRole && account.role !== requestedRole) {
+      incFailedLogin();
       await recordAudit('login_failed', {
         studentId: account.id,
         ip: req.ip,
@@ -126,6 +130,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
     // Verify password
     const valid = await verifyPassword(password, account.password_hash);
     if (!valid) {
+      incFailedLogin();
       // Increment failed attempts and auto-lock at threshold. Uses the
       // shared helper so locked_until is set (the old raw UPDATE only bumped
       // the counter and never locked the account).
@@ -211,6 +216,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
 // =====================================================
 router.post('/admin-portal-login', loginLimiter, csrfProtection, async (req, res) => {
   try {
+    incLoginAttempt();
     const { email, password } = req.body;
 
     if (!email || typeof email !== 'string' || !email.includes('@')) {
@@ -225,6 +231,7 @@ router.post('/admin-portal-login', loginLimiter, csrfProtection, async (req, res
     const normalizedEmail = email.trim().toLowerCase();
 
     if (!adminEmails.includes(normalizedEmail)) {
+      incFailedLogin();
       await recordAudit('admin_portal_login_denied', {
         ip: req.ip,
         metadata: { email: normalizedEmail, reason: 'not_in_admin_list' },
@@ -245,6 +252,7 @@ router.post('/admin-portal-login', loginLimiter, csrfProtection, async (req, res
       given.length === expected.length && timingSafeEqual(given, expected);
 
     if (!matches) {
+      incFailedLogin();
       await recordAudit('admin_portal_login_failed', {
         ip: req.ip,
         metadata: { email: normalizedEmail, reason: 'invalid_password' },
