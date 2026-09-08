@@ -1,14 +1,13 @@
 /**
  * Clerk → Backend Session Bridge
  *
- * After a user signs in with Google via Clerk (frontend), the client calls
+ * After a user signs in with Clerk Email OTP (frontend), the client calls
  * POST /api/v1/auth/clerk-session with the Clerk session token (Bearer).
- * We verify the token against the Clerk dev-instance JWKS, look up the
- * account by verified email, then create a regular backend session
- * (cv_sid cookie + binding token) so all /api/v1 routes work unchanged.
+ * We verify the token via @clerk/express middleware, look up the account
+ * by verified email, then create a regular backend session (cv_sid cookie
+ * + binding token) so all /api/v1 routes work unchanged.
  *
  * Requires env vars:
- *   CLERK_ISSUER     e.g. https://closing-hawk-9939.clerk.accounts.dev
  *   CLERK_SECRET_KEY backend secret key (sk_...) for email cross-check
  */
 
@@ -48,12 +47,12 @@ router.post('/clerk-session', loginLimiter, csrfProtection, requireClerkMiddlewa
       : null;
     if (!primaryEmail) {
       // No server-derived email => do NOT fall back to the client's claim.
-      return authError(res, 401, 'CLERK_EMAIL_UNVERIFIED', 'Could not verify your Google email. Please ensure Clerk is configured and your email is verified.');
+      return authError(res, 401, 'CLERK_EMAIL_UNVERIFIED', 'Could not verify your email. Please ensure Clerk is configured and your email is verified.');
     }
     const email = primaryEmail;
     const requestedRoleRaw = String(req.body.role || '').toUpperCase().trim();
     if (!email || !email.includes('@')) {
-      return authError(res, 400, 'NO_EMAIL', 'Google account has no verified email address.');
+      return authError(res, 400, 'NO_EMAIL', 'Account has no verified email address.');
     }
 
     // ---- 3.5 Invite-only gate + admin bootstrap ----
@@ -89,7 +88,7 @@ router.post('/clerk-session', loginLimiter, csrfProtection, requireClerkMiddlewa
           ip: req.ip,
           metadata: { email, clerkUserId, reason: 'not_invited' },
         });
-        return authError(res, 403, 'NOT_INVITED', 'This Google account has not been invited to CampusVote. Ask the election administrator for access.');
+        return authError(res, 403, 'NOT_INVITED', 'This email has not been invited to CampusVote. Ask the election administrator for access.');
       }
 
       // ---- Auto-provision invited users only ----
@@ -149,7 +148,7 @@ router.post('/clerk-session', loginLimiter, csrfProtection, requireClerkMiddlewa
     // ---- 5. Create backend session (cv_sid cookie set here) ----
     const bindingToken = await createSession(res, account.id, false);
 
-    await recordAudit('clerk_google_login', {
+    await recordAudit('clerk_email_login', {
       studentId: account.id,
       ip: req.ip,
       metadata: { role: account.role, clerkUserId },
