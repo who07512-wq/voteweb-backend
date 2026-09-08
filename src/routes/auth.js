@@ -20,7 +20,7 @@ const { createMfaChallenge, findChallenge, deleteChallenge, incrementChallengeAt
 const { createOtpChallenge, findValidChallenge, verifyOtpChallenge, checkRateLimit, RESEND_COOLDOWN_MS } = require('../services/otpService');
 const { sendLoginOtp, sendPasswordResetOtp } = require('../services/brevoService');
 const { recordAudit, findStudentByIdentifierOrEmail, publicUser, isLocked, incrementFailedLogin, updateStudentLogin } = require('../lib/authDb');
-const { verifyClerkSessionToken } = require('../lib/clerkVerify');
+const { verifyClerkSessionRequest, requireClerkMiddleware } = require('../lib/clerkVerify');
 const { incLoginAttempt, incFailedLogin } = require('../monitoring/metrics');
 
 // Helper for consistent error responses
@@ -1734,7 +1734,7 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 // Vercel/Render frontend register without weakening CSRF for any
 // cookie/session-authenticated route.
 // =====================================================
-router.post('/register/clerk', registerLimiter, async (req, res) => {
+router.post('/register/clerk', registerLimiter, requireClerkMiddleware, async (req, res) => {
   try {
     const { rollNumber, fullName, role, mobileNumber, password } = req.body;
 
@@ -1752,10 +1752,7 @@ router.post('/register/clerk', registerLimiter, async (req, res) => {
     // ---- 1. Prove email ownership via the Clerk session token ----
     let verified;
     try {
-      verified = await verifyClerkSessionToken(
-        (req.headers.authorization || '').replace(/^Bearer /i, ''),
-        String(req.body.email || '')
-      );
+      verified = await verifyClerkSessionRequest(req);
     } catch (err) {
       console.error('register/clerk: token verification failed:', err.message);
       return authError(res, err.status || 401, err.code || 'INVALID_CLERK_TOKEN',
@@ -1867,15 +1864,12 @@ router.post('/register/clerk', registerLimiter, async (req, res) => {
 // same endpoint name so older clients that still POST here never receive a
 // password-change response.
 // =====================================================
-router.post('/forgot-password/clerk', passwordResetLimiter, csrfProtection, async (req, res) => {
+router.post('/forgot-password/clerk', passwordResetLimiter, csrfProtection, requireClerkMiddleware, async (req, res) => {
   try {
     // ---- 1. Prove email ownership via the Clerk session token ----
     let verified;
     try {
-      verified = await verifyClerkSessionToken(
-        (req.headers.authorization || '').replace(/^Bearer /i, ''),
-        String(req.body.email || '')
-      );
+      verified = await verifyClerkSessionRequest(req);
     } catch (err) {
       console.error('forgot-password/clerk: token verification failed:', err.message);
       return authError(res, err.status || 401, err.code || 'INVALID_CLERK_TOKEN',

@@ -1,48 +1,30 @@
 /**
  * Verify a Clerk session token (JWT) issued to a signed-in user.
  *
- * Used by the registration and forgot-password endpoints: the frontend
- * proves email ownership by completing a Clerk email-code challenge, then
- * sends the Clerk session token as a Bearer token. We verify the signature
- * against the instance JWKS and resolve the primary email server-side (via
- * the Clerk Backend API when CLERK_SECRET_KEY is configured).
+ * Used by the registration, forgot-password and clerk-session endpoints: the
+ * frontend proves email ownership by completing a Clerk email-code challenge,
+ * then sends the Clerk session token as a Bearer token. We verify the token
+ * with the official @clerk/express middleware (clerkMiddleware() + getAuth())
+ * and resolve the primary email server-side (via the Clerk Backend API when
+ * CLERK_SECRET_KEY is configured).
  *
  * Throws an Error with .code and .status on failure.
  */
 
-const { createRemoteJWKSet, jwtVerify } = require('jose');
+const { clerkMiddleware, getAuth } = require('@clerk/express');
 
-// ---- JWKS clients cached per issuer ----
-const jwksCache = new Map();
-function getJwks(issuer) {
-  let jwks = jwksCache.get(issuer);
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(`${issuer}/.well-known/jwks.json`));
-    jwksCache.set(issuer, issuer && jwks);
+// Express middleware that requires the Clerk env keys before enabling the
+// official token verification. Returns a friendly 500 configuration error the
+// same way the old manual path did when CLERK_ISSUER was missing.
+function requireClerkMiddleware(req, res, next) {
+  const hasKeys = process.env.CLERK_SECRET_KEY || process.env.CLERK_PUBLISHABLE_KEY;
+  if (!hasKeys) {
+    console.error('clerkVerify: CLERK_SECRET_KEY / CLERK_PUBLISHABLE_KEY not configured');
+    return res.status(500).json({
+      error: { code: 'CLERK_NOT_CONFIGURED', message: 'Clerk bridge is not configured on the server.' },
+    });
   }
-  return jwks;
-}
-
-// ---- Decode JWT payload WITHOUT verifying (only to read iss/aud hints) ----
-function decodeJwtPayload(token) {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
-}
-
-// ---- Decode JWT header WITHOUT verifying (only to read kid/alg hints) ----
-function decodeJwtHeader(token) {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    return JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
+  return clerkMiddleware()(req, res, next);
 }
 
 // ---- Look up the Clerk user's primary email via the Backend API ----
@@ -62,52 +44,16 @@ async function fetchClerkPrimaryEmail(secretKey, clerkUserId) {
 }
 
 /**
- * Verify a Clerk session token and resolve the user's email.
- * @param {string} token - Bearer token from the frontend Clerk session
- * @param {string} [clientEmail] - email the client claims (used only as a
- *   fallback when CLERK_SECRET_KEY is not configured on the server)
+ * Verify the Clerk session token on a request (must run after
+ * requireClerkMiddleware) and resolve the user's email server-side.
+ * @param {import('express').Request} req
  * @returns {Promise<{clerkUserId: string, email: string}>}
  */
-async function verifyClerkSessionToken(token, clientEmail) {
-  const issuer = process.env.CLERK_ISSUER;
-  if (!issuer || !issuer.startsWith('https://')) {
-    const err = new Error('Clerk sign-in bridge is not configured on the server.');
-    err.code = 'CLERK_NOT_CONFIGURED';
-    err.status = 500;
-    throw err;
-  }
-
-  const hints = decodeJwtPayload(token) || {};
-  const iss = hints.iss && String(hints.iss).startsWith('https://') ? hints.iss : issuer;
-  if (iss.replace(/\/$/, '') !== issuer.replace(/\/$/, '')) {
-    const err = new Error('Sign-in token does not match this platform.');
-    err.code = 'CLERK_ISSUER_MISMATCH';
-    err.status = 401;
-    throw err;
-  }
-  const aud = typeof hints.aud === 'string' ? hints.aud : undefined;
-
-  let payload;
-  try {
-    payload = await jwtVerify(token, getJwks(iss), { issuer: iss, audience: aud }).then((r) => r.payload);
-  } catch (verifyErr) {
-    const header = decodeJwtHeader(token);
-    console.error('clerkVerify: jwtVerify failed', {
-      error: verifyErr.message,
-      code: verifyErr.code,
-      header,
-      hints: { iss, aud },
-      now: Date.now() / 1000,
-    });
-    const err = new Error('Sign-in token is invalid or expired. Please sign in again.');
-    err.code = 'INVALID_CLERK_TOKEN';
-    err.status = 401;
-    throw err;
-  }
-
-  const clerkUserId = payload.sub;
+async function verifyClerkSessionRequest(req) {
+  const auth = getAuth(req);
+  const clerkUserId = auth && auth.userId ? auth.userId : null;
   if (!clerkUserId) {
-    const err = new Error('Sign-in token is invalid.');
+    const err = new Error('Sign-in token is invalid or expired. Please sign in again.');
     err.code = 'INVALID_CLERK_TOKEN';
     err.status = 401;
     throw err;
@@ -136,4 +82,4 @@ async function verifyClerkSessionToken(token, clientEmail) {
   return { clerkUserId, email };
 }
 
-module.exports = { verifyClerkSessionToken, fetchClerkPrimaryEmail };
+module.exports = { verifyClerkSessionRequest, requireClerkMiddleware, fetchClerkPrimaryEmail };

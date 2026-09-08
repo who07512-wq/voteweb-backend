@@ -13,7 +13,7 @@
  */
 
 const express = require('express');
-const { createRemoteJWKSet, jwtVerify } = require('jose');
+const { getAuth } = require('@clerk/express');
 const { randomBytes } = require('node:crypto');
 const router = express.Router();
 
@@ -23,82 +23,22 @@ const { loginLimiter } = require('../middleware/rateLimiter');
 const { hashPassword } = require('../lib/password');
 const { createSession } = require('../services/sessionService');
 const { recordAudit, publicUser } = require('../lib/authDb');
+const { requireClerkMiddleware, fetchClerkPrimaryEmail } = require('../lib/clerkVerify');
 
 function authError(res, status, code, message) {
   return res.status(status).json({ error: { code, message } });
 }
 
-// ---- JWKS clients cached per issuer ----
-const jwksCache = new Map();
-function getJwks(issuer) {
-  let jwks = jwksCache.get(issuer);
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(`${issuer}/.well-known/jwks.json`));
-    jwksCache.set(issuer, jwks);
-  }
-  return jwks;
-}
-
-// ---- Decode JWT payload WITHOUT verifying (only to read iss/aud hints) ----
-function decodeJwtPayload(token) {
+router.post('/clerk-session', loginLimiter, csrfProtection, requireClerkMiddleware, async (req, res) => {
   try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
-}
-
-// ---- Look up the Clerk user's primary email via the Backend API ----
-async function fetchClerkPrimaryEmail(secretKey, clerkUserId) {
-  const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(clerkUserId)}`, {
-    headers: { Authorization: `Bearer ${secretKey}` },
-  });
-  if (!res.ok) return null;
-  const user = await res.json();
-  const primaryId = user.primary_email_address_id;
-  const primary = (user.email_addresses || []).find((e) => e.id === primaryId);
-  return primary ? primary.email_address.toLowerCase() : null;
-}
-
-router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => {
-  try {
-    const issuer = process.env.CLERK_ISSUER;
-    if (!issuer || !issuer.startsWith('https://')) {
-      console.error('clerk-session: CLERK_ISSUER not configured');
-      return authError(res, 500, 'CLERK_NOT_CONFIGURED', 'Clerk bridge is not configured on the server.');
-    }
-
-    // ---- 1. Extract Bearer token ----
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-    if (!token) {
-      return authError(res, 401, 'NO_CLERK_TOKEN', 'Missing Clerk session token.');
-    }
-
-    // ---- 2. Read unverified iss/aud (hints only), then verify signature ----
-    const hints = decodeJwtPayload(token) || {};
-    const iss = hints.iss && String(hints.iss).startsWith('https://') ? hints.iss : issuer;
-    if (iss.replace(/\/$/, '') !== issuer.replace(/\/$/, '')) {
-      return authError(res, 401, 'CLERK_ISSUER_MISMATCH', 'Token issuer does not match this instance.');
-    }
-    const aud = typeof hints.aud === 'string' ? hints.aud : undefined;
-
-    let payload;
-    try {
-      payload = await jwtVerify(token, getJwks(iss), { issuer: iss, audience: aud }).then((r) => r.payload);
-    } catch (err) {
-      console.error('clerk-session: JWT verification failed:', err.message);
+    // ---- 1. Verify the Clerk session token (official @clerk/express) ----
+    const auth = getAuth(req);
+    const clerkUserId = auth && auth.userId ? auth.userId : null;
+    if (!clerkUserId) {
       return authError(res, 401, 'INVALID_CLERK_TOKEN', 'Clerk session token is invalid or expired.');
     }
 
-    const clerkUserId = payload.sub;
-    if (!clerkUserId) {
-      return authError(res, 401, 'INVALID_CLERK_TOKEN', 'Clerk token has no subject.');
-    }
-
-    // ---- 3. Resolve email: MUST be the Clerk primary email when the backend
+    // ---- 2. Resolve email: MUST be the Clerk primary email when the backend
     // secret key is configured. If CLERK_SECRET_KEY is missing, we refuse to
     // trust the client-supplied email (otherwise the "email" the account is
     // looked up by is attacker-controlled → account takeover). This makes the
@@ -107,7 +47,6 @@ router.post('/clerk-session', loginLimiter, csrfProtection, async (req, res) => 
     const primaryEmail = secretKey
       ? await fetchClerkPrimaryEmail(secretKey, clerkUserId)
       : null;
-    const clientEmail = String(req.body.email || '').toLowerCase().trim();
     if (!primaryEmail) {
       // No server-derived email => do NOT fall back to the client's claim.
       return authError(res, 401, 'CLERK_EMAIL_UNVERIFIED', 'Could not verify your Google email. Please ensure Clerk is configured and your email is verified.');
