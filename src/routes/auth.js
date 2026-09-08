@@ -1723,7 +1723,18 @@ router.post('/register/instant', registerLimiter, csrfProtection, async (req, re
 // candidate registration is open. ADMIN is NEVER created here — admins are
 // provisioned via ADMIN_EMAILS.
 // =====================================================
-router.post('/register/clerk', registerLimiter, csrfProtection, async (req, res) => {
+// =====================================================
+// CLERK-PROOF REGISTRATION (OTP email code → verified Clerk token)
+//
+// Authenticates exclusively with Authorization: Bearer <Clerk JWT>
+// (verified against Clerk's JWKS in clerkVerify.js). Browsers never attach
+// an Authorization header on their own, so this endpoint is CSRF-immune by
+// design: the double-submit cookie check only protects cookie-authenticated
+// flows. Exempting ONLY this route (no CSRF cookie) lets the cross-site
+// Vercel/Render frontend register without weakening CSRF for any
+// cookie/session-authenticated route.
+// =====================================================
+router.post('/register/clerk', registerLimiter, async (req, res) => {
   try {
     const { rollNumber, fullName, role, mobileNumber, password } = req.body;
 
