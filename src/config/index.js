@@ -17,7 +17,9 @@ const config = {
   isDevelopment: process.env.NODE_ENV !== 'production',
  
   // Security - Session
-  sessionSecret: process.env.SESSION_SECRET || 'dev-only-session-secret-change-in-prod',
+  sessionSecret: process.env.SESSION_SECRET || (process.env.NODE_ENV === 'production'
+    ? (() => { throw new Error('SESSION_SECRET must be set in production'); })()
+    : 'dev-only-session-secret-change-in-prod'),
   sessionTtlHours: parseInt(process.env.SESSION_TTL_HOURS, 10) || 8,
   sessionTtlMs: (parseInt(process.env.SESSION_TTL_HOURS, 10) || 8) * 60 * 60 * 1000,
  
