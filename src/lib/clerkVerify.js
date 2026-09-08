@@ -24,7 +24,23 @@ function requireClerkMiddleware(req, res, next) {
       error: { code: 'CLERK_NOT_CONFIGURED', message: 'Clerk bridge is not configured on the server.' },
     });
   }
+  // Safe debug logging: only header presence + token length. The token value
+  // itself is NEVER logged.
+  const header = req.headers.authorization;
+  const isBearer = typeof header === 'string' && /^Bearer\s+/i.test(header);
+  const raw = typeof header === 'string' ? header.replace(/^Bearer\s+/i, '').trim() : '';
+  const hasAuthHeader = Boolean(header);
+  console.log(`[CLERK DEBUG] authorization present: ${hasAuthHeader}`);
+  console.log(`[CLERK DEBUG] bearer token length: ${isBearer ? raw.length : 0}`);
   return clerkMiddleware()(req, res, next);
+}
+
+/** Log the @clerk/express verification outcome (userId present = verified). */
+function logVerificationResult(req, label) {
+  const auth = getAuth(req);
+  const userId = auth && auth.userId ? auth.userId : null;
+  console.log(`[CLERK DEBUG]${label ? ` ${label}` : ''} verification result: ${userId ? 'valid' : 'invalid'}`);
+  return auth;
 }
 
 // ---- Look up the Clerk user's primary email via the Backend API ----
@@ -50,7 +66,7 @@ async function fetchClerkPrimaryEmail(secretKey, clerkUserId) {
  * @returns {Promise<{clerkUserId: string, email: string}>}
  */
 async function verifyClerkSessionRequest(req) {
-  const auth = getAuth(req);
+  const auth = logVerificationResult(req, 'verifyClerkSessionRequest');
   const clerkUserId = auth && auth.userId ? auth.userId : null;
   if (!clerkUserId) {
     const err = new Error('Sign-in token is invalid or expired. Please sign in again.');
@@ -82,4 +98,4 @@ async function verifyClerkSessionRequest(req) {
   return { clerkUserId, email };
 }
 
-module.exports = { verifyClerkSessionRequest, requireClerkMiddleware, fetchClerkPrimaryEmail };
+module.exports = { verifyClerkSessionRequest, requireClerkMiddleware, fetchClerkPrimaryEmail, logVerificationResult };

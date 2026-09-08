@@ -13,7 +13,6 @@
  */
 
 const express = require('express');
-const { getAuth } = require('@clerk/express');
 const { randomBytes } = require('node:crypto');
 const router = express.Router();
 
@@ -23,7 +22,7 @@ const { loginLimiter } = require('../middleware/rateLimiter');
 const { hashPassword } = require('../lib/password');
 const { createSession } = require('../services/sessionService');
 const { recordAudit, publicUser } = require('../lib/authDb');
-const { requireClerkMiddleware, fetchClerkPrimaryEmail } = require('../lib/clerkVerify');
+const { requireClerkMiddleware, fetchClerkPrimaryEmail, logVerificationResult } = require('../lib/clerkVerify');
 
 function authError(res, status, code, message) {
   return res.status(status).json({ error: { code, message } });
@@ -32,7 +31,7 @@ function authError(res, status, code, message) {
 router.post('/clerk-session', loginLimiter, csrfProtection, requireClerkMiddleware, async (req, res) => {
   try {
     // ---- 1. Verify the Clerk session token (official @clerk/express) ----
-    const auth = getAuth(req);
+    const auth = logVerificationResult(req, 'clerk-session');
     const clerkUserId = auth && auth.userId ? auth.userId : null;
     if (!clerkUserId) {
       return authError(res, 401, 'INVALID_CLERK_TOKEN', 'Clerk session token is invalid or expired.');
