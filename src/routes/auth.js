@@ -1168,7 +1168,7 @@ router.post('/register/verify', otpLimiter, csrfProtection, async (req, res) => 
 // =====================================================
 // LOGOUT
 // =====================================================
-router.post('/logout', csrfProtection, async (req, res) => {
+router.post('/logout', async (req, res) => {
   try {
     // revokeSession(req, res) revokes the DB session row identified by the
     // cv_sid cookie and clears that cookie. Logout is always allowed: it runs
