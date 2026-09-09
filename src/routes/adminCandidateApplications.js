@@ -6,7 +6,6 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/requireAuth');
-const { csrfProtection } = require('../middleware/csrfProtection');
 const candidateAppController = require('../controllers/candidateApplicationController');
 
 // =====================================================
@@ -31,12 +30,12 @@ router.get('/', requireAuth, requireAdmin, candidateAppController.listForAdmin.b
 router.get('/:id', requireAuth, requireAdmin, candidateAppController.getForAdmin.bind(candidateAppController));
 
 // PATCH /api/admin/candidates/:id/approve - Approve application
-router.patch('/:id/approve', requireAuth, requireAdmin, csrfProtection, candidateAppController.approve.bind(candidateAppController));
+router.patch('/:id/approve', requireAuth, requireAdmin, candidateAppController.approve.bind(candidateAppController));
 
 // PATCH /api/admin/candidates/:id/reject - Reject application
-router.patch('/:id/reject', requireAuth, requireAdmin, csrfProtection, candidateAppController.reject.bind(candidateAppController));
+router.patch('/:id/reject', requireAuth, requireAdmin, candidateAppController.reject.bind(candidateAppController));
 
 // PATCH /api/admin/candidates/:id/request-changes - Request changes
-router.patch('/:id/request-changes', requireAuth, requireAdmin, csrfProtection, candidateAppController.requestChanges.bind(candidateAppController));
+router.patch('/:id/request-changes', requireAuth, requireAdmin, candidateAppController.requestChanges.bind(candidateAppController));
 
 module.exports = router;

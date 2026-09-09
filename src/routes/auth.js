@@ -214,7 +214,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
 // password must match ADMIN_PORTAL_PASSWORD (set on the server). The account
 // is found or provisioned as ADMIN and a normal backend session is created.
 // =====================================================
-router.post('/admin-portal-login', loginLimiter, csrfProtection, async (req, res) => {
+router.post('/admin-portal-login', loginLimiter, async (req, res) => {
   try {
     incLoginAttempt();
     const { email, password } = req.body;
