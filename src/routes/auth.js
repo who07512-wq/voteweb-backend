@@ -214,7 +214,7 @@ router.post('/login', loginLimiter, csrfProtection, async (req, res) => {
 // password must match ADMIN_PORTAL_PASSWORD (set on the server). The account
 // is found or provisioned as ADMIN and a normal backend session is created.
 // =====================================================
-router.post('/admin-portal-login', loginLimiter, async (req, res) => {
+router.post('/admin-portal-login', loginLimiter, csrfProtection, async (req, res) => {
   try {
     incLoginAttempt();
     const { email, password } = req.body;
@@ -1168,7 +1168,7 @@ router.post('/register/verify', otpLimiter, csrfProtection, async (req, res) => 
 // =====================================================
 // LOGOUT
 // =====================================================
-router.post('/logout', async (req, res) => {
+router.post('/logout', csrfProtection, async (req, res) => {
   try {
     // revokeSession(req, res) revokes the DB session row identified by the
     // cv_sid cookie and clears that cookie. Logout is always allowed: it runs

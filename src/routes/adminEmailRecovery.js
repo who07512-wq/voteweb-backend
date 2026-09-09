@@ -17,6 +17,7 @@ const router = express.Router();
 
 const db = require('../db');
 const { recordAudit, publicUser } = require('../lib/authDb');
+const { csrfProtection } = require('../middleware/csrfProtection');
 
 function err(res, status, code, message) {
   return res.status(status).json({ error: { code, message } });
@@ -85,7 +86,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // ---- POST /:id/approve ----
-router.post('/:id/approve', async (req, res) => {
+router.post('/:id/approve', csrfProtection, async (req, res) => {
   let client = null;
   try {
     const id = parseInt(req.params.id);
@@ -185,7 +186,7 @@ router.post('/:id/approve', async (req, res) => {
 });
 
 // ---- POST /:id/reject ----
-router.post('/:id/reject', async (req, res) => {
+router.post('/:id/reject', csrfProtection, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return err(res, 400, 'INVALID_ID', 'Invalid request id.');

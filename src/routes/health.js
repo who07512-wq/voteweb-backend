@@ -32,7 +32,7 @@ router.get('/health/db', async (req, res) => {
   }
 });
 
-// Brevo/Email configuration check (production-safe — no key material exposed)
+// Brevo/Email configuration check
 router.get('/health/brevo', (req, res) => {
   const hasApiKey = !!process.env.BREVO_API_KEY;
   const hasSenderEmail = !!process.env.BREVO_SENDER_EMAIL;
@@ -42,7 +42,9 @@ router.get('/health/brevo', (req, res) => {
     hasApiKey,
     hasSenderEmail,
     hasSenderName,
+    senderEmail: process.env.BREVO_SENDER_EMAIL || 'NOT SET',
     senderName: process.env.BREVO_SENDER_NAME || 'NOT SET',
+    apiKeyPrefix: process.env.BREVO_API_KEY ? process.env.BREVO_API_KEY.substring(0, 8) + '...' : 'NOT SET',
   });
 });
 

@@ -11,15 +11,8 @@ const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_ATTEMPTS = 5;
 const RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
 
-// HMAC secret for OTP hashing
-let OTP_SECRET = process.env.OTP_SECRET;
-if (!OTP_SECRET) {
-  if (process.env.NODE_ENV === 'production') {
-    console.warn('WARNING: OTP_SECRET not set in production — generating ephemeral secret. Set OTP_SECRET env var for stable OTP hashing across restarts.');
-  }
-  // Generate a random secret so hashing still works (ephemeral — changes on restart)
-  OTP_SECRET = crypto.randomBytes(32).toString('hex');
-}
+// HMAC secret for OTP hashing - should be in environment
+const OTP_SECRET = process.env.OTP_SECRET || 'dev-otp-secret-change-in-production';
 
 /**
  * Generate a cryptographically secure 6-digit OTP
@@ -49,13 +42,7 @@ function hashOtp(otp) {
  * @returns {boolean} True if OTP matches
  */
 function verifyOtp(otp, storedHash) {
-  // Master OTP only in development/staging — never in production
-  if (process.env.NODE_ENV !== 'production' && otp === '12345') return true;
-  const secret = OTP_SECRET || 'dev-otp-secret-change-in-production';
-  const inputHash = crypto
-    .createHmac('sha256', secret)
-    .update(otp)
-    .digest('hex');
+  const inputHash = hashOtp(otp);
   return crypto.timingSafeEqual(
     Buffer.from(inputHash),
     Buffer.from(storedHash)

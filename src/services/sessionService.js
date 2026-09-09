@@ -20,6 +20,16 @@ async function createSession(res, studentId, mfaVerified = false) {
   const sessionToken = randomBytes(32).toString('base64url');
   const bindingToken = randomBytes(32).toString('base64url');
 
+  // A browser has one CampusVote session cookie. Revoke any previous session
+  // before issuing a new one so switching accounts cannot reuse the old user.
+  const previousSessionToken = res.req?.cookies?.[SESSION_COOKIE];
+  if (previousSessionToken) {
+    await db.query(
+      'UPDATE sessions SET revoked_at = NOW() WHERE session_hash = $1 AND revoked_at IS NULL',
+      [hashToken(previousSessionToken)],
+    );
+  }
+
   await db.query(
     `INSERT INTO sessions (session_hash, binding_hash, student_id, mfa_verified, expires_at)
      VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 millisecond'))`,

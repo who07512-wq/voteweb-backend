@@ -53,6 +53,13 @@ async function sendEmail({ to, subject, html, text }) {
 
   if (!response.ok) {
     console.error('Brevo API error:', { status: response.status, body: responseBody });
+    // Development fallback: an invalid/expired Brevo key should not block
+    // local testing. The email contents (including the OTP) are printed to
+    // the server log instead. Production still fails loudly.
+    if (process.env.NODE_ENV === 'development') {
+      console.log('[dev] Email not sent (Brevo API error). Contents:\n' + (text || ''));
+      return { dev: true };
+    }
     throw new Error(`Brevo API error: ${responseBody.message || response.statusText}`);
   }
 

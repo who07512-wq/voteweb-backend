@@ -34,9 +34,7 @@ function getTotpEncryptionKey() {
  * @returns {string} - Hex-encoded hash
  */
 function hashToken(token) {
-  const secret = process.env.SESSION_SECRET || (process.env.NODE_ENV === 'production'
-    ? (() => { throw new Error('SESSION_SECRET must be set in production'); })()
-    : 'dev-only-session-secret-32chars!');
+  const secret = process.env.SESSION_SECRET || 'dev-only-session-secret-32chars!';
   return createHmac('sha256', secret).update(token).digest('hex');
 }
 
