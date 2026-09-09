@@ -11,10 +11,14 @@ const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_ATTEMPTS = 5;
 const RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
 
-// HMAC secret for OTP hashing - must be set in production
-const OTP_SECRET = process.env.OTP_SECRET;
-if (!OTP_SECRET && process.env.NODE_ENV === 'production') {
-  console.error('FATAL: OTP_SECRET is not set in production. OTP verification will use insecure fallback.');
+// HMAC secret for OTP hashing
+let OTP_SECRET = process.env.OTP_SECRET;
+if (!OTP_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    console.warn('WARNING: OTP_SECRET not set in production — generating ephemeral secret. Set OTP_SECRET env var for stable OTP hashing across restarts.');
+  }
+  // Generate a random secret so hashing still works (ephemeral — changes on restart)
+  OTP_SECRET = crypto.randomBytes(32).toString('hex');
 }
 
 /**
