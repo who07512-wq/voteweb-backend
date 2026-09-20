@@ -281,7 +281,7 @@ async function runBackup(pool, opts = {}) {
 async function listBackups(filterType = null) {
   const { client, bucketId } = backupConfig();
   const storage = new Storage(client);
-  const res = await storage.listFiles(bucketId, [], 100);
+  const res = await storage.listFiles(bucketId, []);
   let files = (res.files || [])
     .filter((f) => f.name.startsWith('voteweb-snapshot-'))
     .map((f) => ({
@@ -300,8 +300,30 @@ async function downloadBackup(fileId, poolOverride) {
   const { client, bucketId } = backupConfig();
   const storage = new Storage(client);
   const res = await storage.getFileDownload(bucketId, fileId);
-  const buf = Buffer.from(await res.arrayBuffer());
-  return JSON.parse(buf.toString('utf8'));
+  // node-appwrite may return parsed JSON object (if content-type json) or ArrayBuffer/Buffer
+  if (res && typeof res === 'object' && res.format === 'voteweb-db-snapshot') {
+    return res;
+  }
+  let buf;
+  if (Buffer.isBuffer(res)) buf = res;
+  else if (res instanceof ArrayBuffer) buf = Buffer.from(res);
+  else if (res instanceof Uint8Array) buf = Buffer.from(res);
+  else if (res && typeof res.arrayBuffer === 'function') buf = Buffer.from(await res.arrayBuffer());
+  else if (typeof res === 'string') buf = Buffer.from(res, 'utf8');
+  else if (res && typeof res === 'object') {
+    // Fallback: stringify object then parse
+    return res;
+  } else {
+    buf = Buffer.from(String(res), 'utf8');
+  }
+  const text = buf.toString('utf8');
+  try {
+    return JSON.parse(text);
+  } catch {
+    // If already object-like string, try direct
+    if (typeof res === 'object') return res;
+    throw new Error('Failed to parse snapshot JSON');
+  }
 }
 
 /**

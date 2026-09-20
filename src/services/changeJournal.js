@@ -426,7 +426,7 @@ async function healthCheck() {
   if (!config) return { configured: false, error: 'Appwrite env not set' };
   try {
     const storage = new Storage(config.client);
-    await storage.listFiles(config.bucketId, [], 1);
+    await storage.listFiles(config.bucketId, []);
     return { configured: true, bucketId: config.bucketId, private: true };
   } catch (err) {
     return { configured: false, error: err.message, bucketId: config.bucketId };
