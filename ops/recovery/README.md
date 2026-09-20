@@ -11,13 +11,23 @@ Recovery scripts here are **historical evidence** and **manual procedures**, not
 - **Do NOT** add to `migrations/` or run via `npm run migrate`.
 
 ## How to Execute a Recovery (if ever needed again)
-1. **Verify target** — confirm `DATABASE_URL` or `--target` is the intended DB (staging first, never assume prod).
-2. **Verified backup** — `await backupService.runBackup(pool, {snapshotType:'pre-recovery', verify:true})` → check `verified, checksum, row_counts, fileId`. Record `migration_preflight` row.
-3. **Journal** — `changeJournal.record({operation:'MIGRATION_PREFLIGHT', ...})` + `recordCriticalAndEnqueue` for durability.
-4. **Prod guard** — `ALLOW_PRODUCTION_RESTORE=true` + `CONFIRM_PRODUCTION_RESTORE=<snapshot_id|checksum>` if target is prod-like.
-5. **Confirmation** — type `RESTORE <8char>` or `CONFIRM <token>` as required by `scripts/restore-backup.js`.
-6. **Execute** — `psql $DATABASE_URL -f ops/recovery/057_restore_real_candidates.sql` **or** via hardened `node scripts/restore-backup.js --file ops/recovery/057_restore_real_candidates.sql --target ... --confirm ...` (which does steps 2–5 internally).
-7. **Verify** — `SELECT count(*) FROM candidate_applications WHERE status='approved'` and compare to expected, check journal `CANDIDATE_APPLICATION_CREATED` events.
+**Important distinction:** `scripts/restore-backup.js` / `restoreService.safeRestore` only restores **snapshot files** (`db-backups` JSON, e.g., `voteweb-snapshot-*.json`) — it does **not** execute arbitrary SQL. `057` is historical **SQL**, not a snapshot, so it requires a separate SQL execution path.
+
+For **snapshot restores** (generic):
+1. **Verify target** — confirm `DATABASE_URL` or `--target` is intended DB (staging first).
+2. **Verified pre-restore backup** — `restoreService.safeRestore` automatically creates `pre-restore` snapshot with `verify:true` (fail-closed if fails) — you do not run `psql`.
+3. **Prod guard** — `ALLOW_PRODUCTION_RESTORE=true` + `--confirm <snapshot_id|checksum>` if prod.
+4. **Execute** — `node scripts/restore-backup.js --file-id <id> --target ... --confirm ...`
+5. **Verify** — `SELECT` row counts, journal `RESTORE_COMPLETED`.
+
+For **SQL recovery (057)** — historical, not snapshot:
+1. **Verify target** — same as above, but explicitly confirm target is **not** prod unless intentional.
+2. **Verified pre-recovery backup** — manually run `await backupService.runBackup(targetPool, {snapshotType:'pre-recovery', verify:true})` via `node -e` or `ops/recovery/run.js` (must succeed, checksum verified). Record `migration_preflight`.
+3. **Journal** — `changeJournal.recordCritical({operation:'MIGRATION_PREFLIGHT', ...})` (durably spooled).
+4. **Prod guard** — same `ALLOW_PRODUCTION_RESTORE` + `CONFIRM` if target is prod-like (even for SQL, treat as prod restore).
+5. **Confirmation** — interactive `RESTORE <8char>` if CLI, or explicit operator sign-off.
+6. **Execute SQL** — **only** via `psql $DATABASE_URL -f ops/recovery/057_restore_real_candidates.sql` after steps 1–5, **not** via snapshot restore CLI. Do not use `npm run migrate` for this.
+7. **Verify** — `SELECT count(*) FROM candidate_applications WHERE status='approved'` and journal.
 
 ## Safety
 - Requires explicit operator authorization — not part of `render.yaml` `preDeployCommand`.

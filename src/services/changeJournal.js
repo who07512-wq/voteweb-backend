@@ -202,6 +202,9 @@ function recordCriticalAndEnqueue(params) {
     const line = JSON.stringify(ev) + '\n';
     fs.appendFileSync(RETRY_FILE, line, 'utf8');
   } catch (e) {
+    lastFailureAt = new Date().toISOString();
+    lastFailureError = e.message;
+    failureCount++;
     console.error(`[journal] CRITICAL spool failed for ${ev.operation} ${ev.event_id}: ${e.message}`);
     throw new Error(`journal durable enqueue failed: ${e.message}`);
   }

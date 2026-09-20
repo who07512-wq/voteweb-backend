@@ -42,24 +42,25 @@ class VoteService {
     const position = positionCheck.rows[0];
     if (!hasConstituency || parsedConstituencyId !== position.constituency_id) return { success: false, error: 'Constituency does not belong to this position', code: 'CONSTITUENCY_NOT_FOUND', status: 404 };
 
-    // Capture true beforeAuth state BEFORE any mutation
-    let beforeAuthRow = (await db.query(`SELECT id, student_id, election_id, is_authorized, expires_at FROM voter_authorizations WHERE student_id=$1 AND election_id=$2`, [parsedStudentId, parsedElectionId])).rows[0] || null;
+    // Capture true beforeAuth state BEFORE any mutation (no mutation yet)
+    const beforeAuthRow = (await db.query(`SELECT id, student_id, election_id, is_authorized, expires_at FROM voter_authorizations WHERE student_id=$1 AND election_id=$2`, [parsedStudentId, parsedElectionId])).rows[0] || null;
 
     let authRows = (await db.query(`SELECT id, is_authorized, expires_at FROM voter_authorizations WHERE student_id=$1 AND election_id=$2 AND is_authorized=true`, [parsedStudentId, parsedElectionId])).rows;
     let didCreateAuth = false;
+    let authorization = null;
     if (authRows.length === 0) {
       const elig = await db.query('SELECT id FROM students WHERE id=$1 AND is_active=TRUE AND voting_eligible=TRUE', [parsedStudentId]);
       if (elig.rows.length === 0) return { success: false, error: 'Student is not authorized for this election', code: 'NOT_AUTHORIZED', status: 403 };
-      // This auto-create should be inside transaction to be truthful, but we do it here outside TX for backward compat
-      // To make it transactional, we will include it in the vote TX below via client. For now, also handle outside.
-      // We will re-read beforeAuth already captured (null), and after will be the inserted row.
-      await db.query(`INSERT INTO voter_authorizations (student_id, election_id, is_authorized) SELECT $1,$2,TRUE WHERE NOT EXISTS (SELECT 1 FROM voter_authorizations WHERE student_id=$1 AND election_id=$2)`, [parsedStudentId, parsedElectionId]);
+      // Defer actual INSERT to inside transaction for atomicity — just mark intent here
       didCreateAuth = true;
-      authRows = (await db.query(`SELECT id, is_authorized, expires_at FROM voter_authorizations WHERE student_id=$1 AND election_id=$2 AND is_authorized=true`, [parsedStudentId, parsedElectionId])).rows;
-      if (authRows.length === 0) return { success: false, error: 'Student is not authorized for this election', code: 'NOT_AUTHORIZED', status: 403 };
+      // Do not INSERT yet; will be done inside TX. Keep authRows empty for now, but we know student is eligible.
+      // We will validate inside TX; for now, set authorization to null and proceed to further validation steps
+      // that don't require authorization yet. The TX will create it.
+    } else {
+      authorization = authRows[0];
+      if (authorization.expires_at && new Date(authorization.expires_at) < now) return { success: false, error: 'Authorization has expired', code: 'AUTHORIZATION_EXPIRED', status: 403 };
     }
-    const authorization = authRows[0];
-    if (authorization.expires_at && new Date(authorization.expires_at) < now) return { success: false, error: 'Authorization has expired', code: 'AUTHORIZATION_EXPIRED', status: 403 };
+    // If didCreateAuth, expiration check will be done after TX creation (new row has no expires_at)
 
     const constituencyCheck = await db.query('SELECT id, election_id, department, year, section, is_active FROM constituencies WHERE id=$1', [parsedConstituencyId]);
     if (constituencyCheck.rows.length === 0 || constituencyCheck.rows[0].election_id !== parsedElectionId) return { success: false, error: 'Constituency not found in this election', code: 'CONSTITUENCY_NOT_FOUND', status: 404 };
@@ -92,12 +93,23 @@ class VoteService {
         await client.query('ROLLBACK');
         return { success: false, error: 'You have already voted for this position', code: 'ALREADY_VOTED', status: 409 };
       }
-      // Ensure authorization exists inside TX (if we auto-created outside, this is no-op; if not, create)
+      // Authorization mutation must be inside same TX for atomicity
       if (didCreateAuth) {
-        // already created outside, but ensure afterAuth is the row we created
+        // Create authorization inside TX (was deferred from outside)
+        await client.query(`INSERT INTO voter_authorizations (student_id, election_id, is_authorized) SELECT $1,$2,TRUE WHERE NOT EXISTS (SELECT 1 FROM voter_authorizations WHERE student_id=$1 AND election_id=$2)`, [parsedStudentId, parsedElectionId]);
         afterAuthRow = (await client.query(`SELECT id, student_id, election_id, is_authorized, expires_at FROM voter_authorizations WHERE student_id=$1 AND election_id=$2`, [parsedStudentId, parsedElectionId])).rows[0] || null;
+        if (!afterAuthRow || !afterAuthRow.is_authorized) {
+          await client.query('ROLLBACK');
+          return { success: false, error: 'Student is not authorized for this election', code: 'NOT_AUTHORIZED', status: 403 };
+        }
+        // Newly created row has no expires_at, so no expiration check needed
       } else {
         afterAuthRow = beforeAuthRow;
+        // Re-validate expiration inside TX using the authoritative before row
+        if (afterAuthRow && afterAuthRow.expires_at && new Date(afterAuthRow.expires_at) < new Date()) {
+          await client.query('ROLLBACK');
+          return { success: false, error: 'Authorization has expired', code: 'AUTHORIZATION_EXPIRED', status: 403 };
+        }
       }
 
       const voteRes = await client.query(`INSERT INTO votes (student_id, election_id, constituency_id, position_id, candidate_id, voted_at) VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id, student_id, election_id, constituency_id, position_id, candidate_id, voted_at`, [parsedStudentId, parsedElectionId, voteConstituencyId, parsedPositionId, parsedCandidateId]);
@@ -130,13 +142,7 @@ class VoteService {
     }
 
     incVotesCast();
-
-    // Capture truthful afterAuth if we created it
-    if (didCreateAuth && !afterAuthRow) {
-      afterAuthRow = (await db.query(`SELECT id, student_id, election_id, is_authorized, expires_at FROM voter_authorizations WHERE student_id=$1 AND election_id=$2`, [parsedStudentId, parsedElectionId])).rows[0] || null;
-    } else if (!didCreateAuth) {
-      afterAuthRow = beforeAuthRow;
-    }
+    // afterAuthRow already captured truthfully inside TX (before==after if no mutation, or new row if created)
 
     // Journal only after commit, via durable critical queue
     try {

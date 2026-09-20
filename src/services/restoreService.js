@@ -67,15 +67,23 @@ async function safeRestore(snapshot, pool, opts = {}) {
     // Non-prod still requires confirmToken if snapshot is prod-like? No, but if opts.confirm is required for safety, enforce when provided?
   }
 
-  // Pre-restore backup (fail-closed)
+  // Pre-restore backup (fail-closed) — must use SAME target pool for backup and restore
+  // Prefer explicit pool for target to avoid env mutation race; fallback to passed pool or global
+  let targetPool = pool;
+  let tempPool = null;
+  if (target && !pool) {
+    const { Pool } = require('pg');
+    tempPool = new Pool({ connectionString: targetUrl, ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined, connectionTimeoutMillis: 10000 });
+    targetPool = tempPool;
+  } else if (!targetPool) {
+    targetPool = require('../db').pool;
+  }
   let preBackup = null;
   try {
-    const originalUrl = process.env.DATABASE_URL;
-    if (target) process.env.DATABASE_URL = targetUrl;
-    preBackup = await backupService.runBackup(pool, { snapshotType: 'pre-restore', verify: true });
-    if (target) process.env.DATABASE_URL = originalUrl;
+    preBackup = await backupService.runBackup(targetPool, { snapshotType: 'pre-restore', verify: true });
     if (!preBackup.verified) throw new Error(preBackup.verifyError || 'pre-restore backup not verified');
   } catch (e) {
+    if (tempPool) await tempPool.end().catch(() => {});
     const err = new Error(`Pre-restore backup failed: ${e.message}`);
     err.code = 'PRE_RESTORE_BACKUP_FAILED';
     err.status = 503;
@@ -98,8 +106,13 @@ async function safeRestore(snapshot, pool, opts = {}) {
     await changeJournal.flush();
   } catch {}
 
-  // Perform actual restore via backupService (data-only, TRUNCATE + insert)
-  const restored = await backupService.restoreSnapshot(snapshot, pool);
+  // Perform actual restore via backupService (data-only, TRUNCATE + insert) on SAME target pool
+  let restored;
+  try {
+    restored = await backupService.restoreSnapshot(snapshot, targetPool);
+  } finally {
+    if (tempPool) await tempPool.end().catch(() => {});
+  }
 
   try {
     changeJournal.record({
