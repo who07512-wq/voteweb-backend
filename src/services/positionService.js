@@ -4,6 +4,8 @@
  */
 
 const db = require('../db');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 // Recommended position names (not enforced by database)
 const RECOMMENDED_POSITIONS = [
@@ -76,7 +78,7 @@ class PositionService {
   /**
    * Create a new position (constituency-backed — Class Representative seats)
    */
-  async create(data) {
+  async create(data, journalCtx = {}) {
     const { constituency_id, name, description, display_order } = data;
 
     if (constituency_id === undefined || constituency_id === null) {
@@ -97,6 +99,20 @@ class PositionService {
         display_order !== undefined ? display_order : 0,
       ]
     );
+    try {
+      changeJournal.record({
+        operation: 'POSITION_CREATED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('position-create'),
+        entity: 'positions',
+        entityId: result.rows[0].id,
+        before: null,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] POSITION_CREATED failed:', e.message); }
 
     return result.rows[0];
   }
@@ -104,7 +120,7 @@ class PositionService {
   /**
    * Update a position
    */
-  async update(id, data) {
+  async update(id, data, journalCtx = {}) {
     const position = await this.findById(id);
     if (!position) return null;
 
@@ -137,6 +153,20 @@ class PositionService {
 
     const query = `UPDATE positions SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
     const result = await db.query(query, params);
+    try {
+      changeJournal.record({
+        operation: 'POSITION_UPDATED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('position-update'),
+        entity: 'positions',
+        entityId: id,
+        before: position,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] POSITION_UPDATED failed:', e.message); }
     return result.rows[0];
   }
 

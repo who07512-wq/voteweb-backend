@@ -42,6 +42,10 @@ coverage/
 DEV-ACCOUNT.md
 *dev*.md
 
+# Change journal local fallback / retry queue (off-host durability; not committed)
+.journal-retry.jsonl
+journal-fallback/
+
 # Environment files (contains secrets)
 .env
 .env.*

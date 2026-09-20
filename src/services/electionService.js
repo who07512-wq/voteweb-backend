@@ -4,6 +4,8 @@
  */
 
 const db = require('../db');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 // Valid status transitions
 const STATUS_TRANSITIONS = {
@@ -71,7 +73,7 @@ class ElectionService {
   /**
    * Create a new election
    */
-  async create(data) {
+  async create(data, journalCtx = {}) {
     const { name, description, start_time, end_time } = data;
 
     const result = await db.query(
@@ -80,6 +82,20 @@ class ElectionService {
        RETURNING *`,
       [name, description || null, start_time || null, end_time || null]
     );
+    try {
+      changeJournal.record({
+        operation: 'ELECTION_CREATED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('election-create'),
+        entity: 'elections',
+        entityId: result.rows[0].id,
+        before: null,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] ELECTION_CREATED failed:', e.message); }
 
     return result.rows[0];
   }
@@ -135,14 +151,28 @@ class ElectionService {
     params.push(id);
 
     const query = `UPDATE elections SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
+    const before = election;
     const result = await db.query(query, params);
+    try {
+      changeJournal.record({
+        operation: 'ELECTION_UPDATED',
+        source: 'admin-api',
+        actorType: 'ADMIN',
+        requestId: systemCorrelationId('election-update'),
+        entity: 'elections',
+        entityId: id,
+        before,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] ELECTION_UPDATED failed:', e.message); }
     return result.rows[0];
   }
 
   /**
    * Update election status with transition validation
    */
-  async updateStatus(id, newStatus) {
+  async updateStatus(id, newStatus, journalCtx = {}) {
     const election = await this.findById(id);
     if (!election) return { error: 'NOT_FOUND' };
 
@@ -171,7 +201,23 @@ class ElectionService {
     query += ` WHERE id = $${params.length + 1} RETURNING *`;
     params.push(id);
 
+    const beforeStatus = election;
     const result = await db.query(query, params);
+    try {
+      changeJournal.record({
+        operation: 'ELECTION_STATUS_CHANGED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('election-status'),
+        entity: 'elections',
+        entityId: id,
+        before: beforeStatus,
+        after: result.rows[0],
+        success: true,
+        metadata: { previousStatus, newStatus },
+      });
+    } catch (e) { console.error('[journal] ELECTION_STATUS_CHANGED failed:', e.message); }
 
     return { election: result.rows[0], previousStatus };
   }

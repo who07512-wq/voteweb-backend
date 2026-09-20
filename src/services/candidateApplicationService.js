@@ -8,6 +8,8 @@ const candidateService = require('./candidateService');
 const constituencyService = require('./constituencyService');
 const electionService = require('./electionService');
 const positionService = require('./positionService');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 class CandidateApplicationService {
   /**
@@ -106,6 +108,23 @@ class CandidateApplicationService {
         appCategory, electionId ? parseInt(electionId) : null,
       ]
     );
+
+    // Journal: candidate application created (before=null, after=row)
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_APPLICATION_CREATED',
+        source: 'student-api',
+        actorId: studentId,
+        actorType: 'STUDENT',
+        requestId: systemCorrelationId('candidate-apply'),
+        entity: 'candidate_applications',
+        entityId: result.rows[0].id,
+        before: null,
+        after: result.rows[0],
+        success: true,
+        metadata: { enrollmentNumber, department, year, section },
+      });
+    } catch (e) { console.error('[journal] create failed:', e.message); }
 
     return this.formatApplication(result.rows[0]);
   }
@@ -381,68 +400,100 @@ class CandidateApplicationService {
       }
     }
 
-    const result = await db.query(
-      `UPDATE candidate_applications
-       SET status = 'approved',
-           reviewed_by = $1,
-           reviewed_at = NOW(),
-           updated_at = NOW(),
-           election_id = COALESCE($3, election_id),
-           position_id = COALESCE($4, position_id)
-       WHERE id = $2 AND status = 'under_review'
-       RETURNING *`,
-      [
-        adminId, id,
-        isCR ? crElectionId : null,
-        isCR ? context._positionId : null,
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      const error = new Error('Application is not under review or no longer exists.');
-      error.code = 'INVALID_STATUS';
-      error.status = 400;
-      throw error;
+    // Transactional approval: read BEFORE rows, mutate application + student + ballot atomically, then journal
+    const beforeAppRow = (await db.query(`SELECT * FROM candidate_applications WHERE id=$1`, [id])).rows[0];
+    const beforeStudentRow = beforeAppRow?.student_id ? (await db.query(`SELECT id, role, email FROM students WHERE id=$1`, [beforeAppRow.student_id])).rows[0] : null;
+    let beforeCandidateRow = null;
+    if (beforeAppRow?.position_id && beforeAppRow?.full_name) {
+      const candCheck = await db.query(`SELECT * FROM candidates WHERE position_id=$1 AND name=$2`, [context._positionId || beforeAppRow.position_id, beforeAppRow.full_name]);
+      beforeCandidateRow = candCheck.rows[0] || null;
     }
 
-    // Approval is what EARNS the applicant the CANDIDATE role. The login-time
-    // role picker no longer grants it — this is the only promotion path.
-    const appId = result.rows[0].student_id;
-    if (appId) {
-      await db.query(
-        `UPDATE students SET role = 'CANDIDATE', updated_at = NOW()
-         WHERE id = $1 AND role IN ('STUDENT', 'CANDIDATE')`,
-        [appId]
+    const client = await db.pool.connect();
+    let afterAppRow, afterStudentRow, afterCandidateRow = null;
+    let ballotBestEffortFailed = null;
+    try {
+      await client.query('BEGIN');
+      const upd = await client.query(
+        `UPDATE candidate_applications
+         SET status = 'approved',
+             reviewed_by = $1,
+             reviewed_at = NOW(),
+             updated_at = NOW(),
+             election_id = COALESCE($3, election_id),
+             position_id = COALESCE($4, position_id)
+         WHERE id = $2 AND status = 'under_review'
+         RETURNING *`,
+        [adminId, id, isCR ? crElectionId : null, isCR ? context._positionId : null]
       );
-    }
-
-    // Also create a ballot row in `candidates` so the approved applicant
-    // actually appears on the ballot. Only possible when a position_id was
-    // supplied (position_id is optional on the application). If no position,
-    // the candidate cannot be on a ballot; skip silently.
-    if (result.rows[0].position_id) {
-      try {
-        await candidateService.create({
-          position_id: result.rows[0].position_id,
-          name: result.rows[0].full_name,
-          description: result.rows[0].bio || result.rows[0].manifesto || null,
-          image_url: result.rows[0].profile_photo_url || null,
-        });
-      } catch (err) {
-        // Duplicate name within the same position OR position no longer valid.
-        // Do not fail the approval: the application is still valid, the ballot
-        // row is best-effort. Log and continue.
-        if (err.code !== '23505' && err.code !== '23503') {
-          throw err;
-        }
-        console.warn(
-          'approve: could not create candidates ballot row',
-          { applicationId: id, positionId: result.rows[0].position_id, code: err.code }
-        );
+      if (upd.rows.length === 0) {
+        await client.query('ROLLBACK');
+        const error = new Error('Application is not under review or no longer exists.');
+        error.code = 'INVALID_STATUS';
+        error.status = 400;
+        throw error;
       }
+      afterAppRow = upd.rows[0];
+      const appId = afterAppRow.student_id;
+      if (appId) {
+        const stuUpd = await client.query(
+          `UPDATE students SET role = 'CANDIDATE', updated_at = NOW()
+           WHERE id = $1 AND role IN ('STUDENT', 'CANDIDATE')
+           RETURNING id, role, email`,
+          [appId]
+        );
+        afterStudentRow = stuUpd.rows[0] || beforeStudentRow;
+      }
+      if (afterAppRow.position_id) {
+        try {
+          const candRes = await client.query(
+            `INSERT INTO candidates (position_id, name, description, image_url, display_order)
+             VALUES ($1, $2, $3, $4, COALESCE((SELECT MAX(display_order)+1 FROM candidates WHERE position_id=$1),1))
+             RETURNING *`,
+            [afterAppRow.position_id, afterAppRow.full_name, afterAppRow.bio || afterAppRow.manifesto || null, afterAppRow.profile_photo_url || null]
+          );
+          afterCandidateRow = candRes.rows[0];
+        } catch (err) {
+          if (err.code !== '23505' && err.code !== '23503') throw err;
+          ballotBestEffortFailed = err.code;
+          // best-effort: don't fail approval, keep existing candidate row if present
+          const existing = await client.query(`SELECT * FROM candidates WHERE position_id=$1 AND name=$2`, [afterAppRow.position_id, afterAppRow.full_name]);
+          afterCandidateRow = existing.rows[0] || null;
+          console.warn('approve: could not create candidates ballot row', { applicationId: id, positionId: afterAppRow.position_id, code: err.code });
+        }
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
+    } finally {
+      client.release();
     }
 
-    return this.formatApplication(result.rows[0]);
+    // Journal the logical multi-table operation (one event with all affected rows)
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_APPROVED',
+        source: context._source || 'admin-api',
+        actorId: adminId,
+        actorType: 'ADMIN',
+        requestId: context._requestId || systemCorrelationId('candidate-approve'),
+        entity: 'candidate_applications',
+        entityId: id,
+        before: beforeAppRow,
+        after: afterAppRow,
+        affectedRows: {
+          candidate_applications: [{ before: beforeAppRow, after: afterAppRow }],
+          students: beforeStudentRow || afterStudentRow ? [{ before: beforeStudentRow, after: afterStudentRow }] : [],
+          candidates: afterCandidateRow ? [{ before: beforeCandidateRow, after: afterCandidateRow }] : (ballotBestEffortFailed ? [{ before: beforeCandidateRow, after: null, diff: { error: ballotBestEffortFailed } }] : []),
+        },
+        success: true,
+        metadata: { electionId: crElectionId, positionId: context._positionId, ballotBestEffortFailed },
+        gitCommit: context._gitCommit,
+      });
+    } catch (e) { console.error('[journal] CANDIDATE_APPROVED failed:', e.message); }
+
+    return this.formatApplication(afterAppRow);
   }
 
   /**
@@ -671,41 +722,71 @@ class CandidateApplicationService {
       throw error;
     }
 
-    const result = await db.query(
-      `UPDATE candidate_applications
-       SET status = 'rejected',
-           rejection_reason = $1,
-           reviewed_by = $2,
-           reviewed_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $3
-       RETURNING *`,
-      [reason, adminId, id]
-    );
+    // Transactional reject: capture BEFORE, mutate, then journal
+    const beforeAppReject = (await db.query(`SELECT * FROM candidate_applications WHERE id=$1`, [id])).rows[0];
+    const beforeStudentReject = beforeAppReject?.student_id ? (await db.query(`SELECT id, role FROM students WHERE id=$1`, [beforeAppReject.student_id])).rows[0] : null;
+    const beforeCandidateReject = beforeAppReject?.position_id ? (await db.query(`SELECT * FROM candidates WHERE position_id=$1 AND name=$2`, [beforeAppReject.position_id, beforeAppReject.full_name])).rows[0] : null;
 
-    // If this applicant was promoted by a previous approval that was later
-    // reversed, drop them back to STUDENT (never touch ADMIN/CAD accounts).
-    const appId = result.rows[0].student_id;
-    if (appId) {
-      await db.query(
-        `UPDATE students SET role = 'STUDENT', updated_at = NOW()
-         WHERE id = $1 AND role = 'CANDIDATE'`,
-        [appId]
+    const clientR = await db.pool.connect();
+    let afterAppReject, afterStudentReject;
+    try {
+      await clientR.query('BEGIN');
+      const upd = await clientR.query(
+        `UPDATE candidate_applications
+         SET status = 'rejected',
+             rejection_reason = $1,
+             reviewed_by = $2,
+             reviewed_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [reason, adminId, id]
       );
+      afterAppReject = upd.rows[0];
+      const appId = afterAppReject.student_id;
+      if (appId) {
+        const sUpd = await clientR.query(
+          `UPDATE students SET role = 'STUDENT', updated_at = NOW()
+           WHERE id = $1 AND role = 'CANDIDATE'
+           RETURNING id, role`,
+          [appId]
+        );
+        afterStudentReject = sUpd.rows[0] || beforeStudentReject;
+      }
+      if (afterAppReject.position_id && afterAppReject.full_name) {
+        await clientR.query(`DELETE FROM candidates WHERE position_id=$1 AND name=$2`, [afterAppReject.position_id, afterAppReject.full_name]);
+      }
+      await clientR.query('COMMIT');
+    } catch (err) {
+      try { await clientR.query('ROLLBACK'); } catch {}
+      throw err;
+    } finally {
+      clientR.release();
     }
+    // Fetch after candidate deletion result (null if deleted)
+    const afterCandidateReject = beforeCandidateReject ? (await db.query(`SELECT * FROM candidates WHERE position_id=$1 AND name=$2`, [beforeCandidateReject.position_id, beforeCandidateReject.name])).rows[0] || null : null;
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_REJECTED',
+        source: 'admin-api',
+        actorId: adminId,
+        actorType: 'ADMIN',
+        requestId: systemCorrelationId('candidate-reject'),
+        entity: 'candidate_applications',
+        entityId: id,
+        before: beforeAppReject,
+        after: afterAppReject,
+        affectedRows: {
+          candidate_applications: [{ before: beforeAppReject, after: afterAppReject }],
+          students: [{ before: beforeStudentReject, after: afterStudentReject }],
+          candidates: [{ before: beforeCandidateReject, after: afterCandidateReject }],
+        },
+        success: true,
+        metadata: { reason },
+      });
+    } catch (e) { console.error('[journal] CANDIDATE_REJECTED failed:', e.message); }
 
-    // Remove the ballot row this applicant may have earned when they were
-    // approved, so a reversed approval does not leave them contesting on the
-    // ballot. Scoped by position (required) and name (the person).
-    if (result.rows[0].position_id && result.rows[0].full_name) {
-      await db.query(
-        `DELETE FROM candidates
-         WHERE position_id = $1 AND name = $2`,
-        [result.rows[0].position_id, result.rows[0].full_name]
-      );
-    }
-
-    return this.formatApplication(result.rows[0]);
+    return this.formatApplication(afterAppReject);
   }
 
   /**
@@ -728,6 +809,7 @@ class CandidateApplicationService {
       throw error;
     }
 
+    const beforeRC = (await db.query(`SELECT * FROM candidate_applications WHERE id=$1`, [id])).rows[0];
     const result = await db.query(
       `UPDATE candidate_applications
        SET status = 'changes_requested',
@@ -739,6 +821,21 @@ class CandidateApplicationService {
        RETURNING *`,
       [reason, adminId, id]
     );
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_CHANGES_REQUESTED',
+        source: 'admin-api',
+        actorId: adminId,
+        actorType: 'ADMIN',
+        requestId: systemCorrelationId('candidate-changes-requested'),
+        entity: 'candidate_applications',
+        entityId: id,
+        before: beforeRC,
+        after: result.rows[0],
+        success: true,
+        metadata: { reason },
+      });
+    } catch (e) { console.error('[journal] changes_requested failed:', e.message); }
 
     return this.formatApplication(result.rows[0]);
   }
@@ -775,6 +872,7 @@ class CandidateApplicationService {
     // Update only allowed fields (verified fields are NOT allowed to change)
     const { bio, manifesto, profilePhotoUrl, email, phone } = data;
 
+    const beforeResubmit = (await db.query(`SELECT * FROM candidate_applications WHERE id=$1`, [id])).rows[0];
     const result = await db.query(
       `UPDATE candidate_applications
        SET status = 'under_review',
@@ -791,6 +889,20 @@ class CandidateApplicationService {
        RETURNING *`,
       [bio, manifesto, profilePhotoUrl, email, phone, id]
     );
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_RESUBMITTED',
+        source: 'student-api',
+        actorId: studentId,
+        actorType: 'STUDENT',
+        requestId: systemCorrelationId('candidate-resubmit'),
+        entity: 'candidate_applications',
+        entityId: id,
+        before: beforeResubmit,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] resubmit failed:', e.message); }
 
     return this.formatApplication(result.rows[0]);
   }
@@ -827,6 +939,7 @@ class CandidateApplicationService {
     // Only allow editable fields
     const { bio, manifesto, profilePhotoUrl } = data;
 
+    const beforeProfile = (await db.query(`SELECT * FROM candidate_applications WHERE id=$1`, [id])).rows[0];
     const result = await db.query(
       `UPDATE candidate_applications
        SET bio = COALESCE($1, bio),
@@ -837,6 +950,20 @@ class CandidateApplicationService {
        RETURNING *`,
       [bio, manifesto, profilePhotoUrl, id]
     );
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_PROFILE_UPDATED',
+        source: 'student-api',
+        actorId: studentId,
+        actorType: 'STUDENT',
+        requestId: systemCorrelationId('candidate-profile-update'),
+        entity: 'candidate_applications',
+        entityId: id,
+        before: beforeProfile,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] profile update failed:', e.message); }
 
     return this.formatApplication(result.rows[0]);
   }

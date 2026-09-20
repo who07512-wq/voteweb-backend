@@ -43,6 +43,7 @@ const uploadsRoutes = require('./routes/uploads');
 const { loadSession } = require('./middleware/loadSession');
 const { requireAuth } = require('./middleware/requireAuth');
 const { requireAdmin } = require('./middleware/requireAdmin');
+const { requestIdMiddleware } = require('./middleware/requestId');
 const { httpMetricsMiddleware, metricsHandler, buildMonitoringSummary } = require('./monitoring/metrics');
 
 const app = express();
@@ -52,6 +53,16 @@ const isDev = process.env.NODE_ENV !== 'production';
 // real client IP. Without this, every user shares the proxy IP and the
 // per-IP rate limiters (login, register, voting) become global.
 app.set('trust proxy', 1);
+
+// Request correlation — must be first so every log / journal has request_id
+app.use(requestIdMiddleware);
+app.use((req, res, next) => {
+  // expose via response header
+  res.setHeader('X-Request-Id', req.requestId);
+  // also set correlation header for downstream
+  res.setHeader('X-Correlation-Id', req.requestId);
+  next();
+});
 
 // Security middleware
 app.use(helmet({
@@ -98,7 +109,8 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Session-Binding'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Session-Binding', 'X-Request-Id', 'X-Correlation-Id'],
+  exposedHeaders: ['X-Request-Id', 'X-Correlation-Id'],
 };
 app.use(cors(corsOptions));
 
@@ -164,6 +176,36 @@ app.get('/api/health/brevo', (req, res) => {
     hasApiKey: !!process.env.BREVO_API_KEY,
     hasSenderEmail: !!process.env.BREVO_SENDER_EMAIL,
     hasSenderName: !!process.env.BREVO_SENDER_NAME,
+  });
+});
+
+// Appwrite / backup / journal health (admin-aware but not leaking secrets)
+app.get('/api/health/backup', async (req, res) => {
+  const backupScheduler = require('./services/backupScheduler');
+  const changeJournal = require('./services/changeJournal');
+  const status = backupScheduler.getStatus();
+  const journalHealth = await changeJournal.healthCheck().catch(() => ({ configured: false, error: 'health check failed' }));
+  // Never echo project IDs or keys
+  res.json({
+    status: status.configured && journalHealth.configured ? 'ok' : 'degraded',
+    backup: {
+      configured: status.configured,
+      intervalHours: status.intervalHours,
+      retention: status.retention,
+      lastSuccess: status.lastSuccess ? { at: status.lastSuccess.at, bytes: status.lastSuccess.bytes } : null,
+      lastFailure: status.lastFailure,
+      consecutiveFailures: status.consecutiveFailures,
+    },
+    journal: {
+      configured: journalHealth.configured,
+      bucketId: journalHealth.bucketId || null,
+      error: journalHealth.error || null,
+    },
+    migrationSafety: {
+      allowDestructiveMigrations: process.env.ALLOW_DESTRUCTIVE_MIGRATIONS || (process.env.NODE_ENV === 'production' ? 'false (default prod)' : 'true (default dev)'),
+      nodeEnv: process.env.NODE_ENV || 'development',
+    },
+    requestId: req.requestId,
   });
 });
 
@@ -288,6 +330,96 @@ app.get('/api/v1/admin/elections/:id/readiness', requireAdmin, (req, res, next) 
   const ElectionController = require('./controllers/electionController');
   const controller = new ElectionController();
   controller.getReadiness.bind(controller)(req, res, next);
+});
+
+// Admin backup / journal observability (private, admin-only)
+app.get('/api/v1/admin/backup/status', requireAdmin, async (req, res) => {
+  const backupScheduler = require('./services/backupScheduler');
+  const backupService = require('./services/backupService');
+  const changeJournal = require('./services/changeJournal');
+  try {
+    const schedulerStatus = backupScheduler.getStatus();
+    const journalHealth = await changeJournal.healthCheck();
+    let latest = null;
+    let verification = null;
+    try {
+      const files = await backupService.listBackups();
+      if (files.length) {
+        latest = files[0];
+        // quick verification of latest (checksum) without exposing contents
+        const v = await backupService.verifyBackup(latest.fileId);
+        verification = { valid: v.valid, error: v.error || null, checksum: v.checksum || null, rowCounts: v.rowCounts || null };
+      }
+    } catch (e) {
+      verification = { valid: false, error: e.message };
+    }
+    res.json({
+      scheduler: schedulerStatus,
+      journal: journalHealth,
+      latestSnapshot: latest,
+      latestVerification: verification,
+      policy: backupService.BACKUP_POLICY,
+      buckets: {
+        backups: backupService.BACKUP_BUCKET_DEFAULT,
+        journal: changeJournal.JOURNAL_BUCKET_DEFAULT,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal Server Error', message: err.message, code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.get('/api/v1/admin/backup/list', requireAdmin, async (req, res) => {
+  const backupService = require('./services/backupService');
+  try {
+    const files = await backupService.listBackups();
+    res.json({ data: files });
+  } catch (err) {
+    res.status(503).json({ error: 'Backup not configured', message: err.message, code: err.code || 'BACKUP_NOT_CONFIGURED' });
+  }
+});
+
+app.post('/api/v1/admin/backup/verify/:fileId', requireAdmin, async (req, res) => {
+  const backupService = require('./services/backupService');
+  try {
+    const v = await backupService.verifyBackup(req.params.fileId);
+    res.json({ valid: v.valid, error: v.error || null, checksum: v.checksum, rowCounts: v.rowCounts });
+  } catch (err) {
+    res.status(500).json({ valid: false, error: err.message });
+  }
+});
+
+// Trigger manual backup (admin-only, journaled)
+app.post('/api/v1/admin/backup/run', requireAdmin, async (req, res) => {
+  const backupService = require('./services/backupService');
+  const changeJournal = require('./services/changeJournal');
+  try {
+    const result = await backupService.runBackup(null, { snapshotType: 'manual', verify: true });
+    changeJournal.record({
+      operation: 'BACKUP_MANUAL',
+      source: 'admin-api',
+      actorId: req.user?.studentId || null,
+      actorType: 'ADMIN',
+      requestId: req.requestId,
+      entity: 'db_backup',
+      entityId: result.fileId,
+      metadata: { bytes: result.bytes, checksum: result.checksum },
+      success: true,
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    changeJournal.record({
+      operation: 'BACKUP_MANUAL_FAILED',
+      source: 'admin-api',
+      actorId: req.user?.studentId || null,
+      actorType: 'ADMIN',
+      requestId: req.requestId,
+      entity: 'db_backup',
+      metadata: { error: err.message },
+      success: false,
+    });
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // CAD election-monitor routes (CAD or ADMIN role)

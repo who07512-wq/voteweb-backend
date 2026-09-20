@@ -7,6 +7,8 @@
 const db = require('../db');
 const crypto = require('crypto');
 const { incVotesCast } = require('../monitoring/metrics');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 class VoteService {
   /**
@@ -309,6 +311,33 @@ class VoteService {
     const vote = voteResult.rows[0];
     incVotesCast();
     const receipt = await this.generateReceipt(vote.id, vote.election_id, vote.student_id);
+
+    // Journal the logical multi-table vote operation (votes + voter_authorizations + receipts)
+    // For recovery we need vote link but keep bucket private; candidate choices are required for recovery
+    try {
+      const beforeAuth = authorization; // existing auth row before vote
+      // fetch updated auth if it was auto-created
+      let afterAuth = beforeAuth;
+      // receipt is new, vote is new
+      changeJournal.record({
+        operation: 'VOTE_CAST',
+        source: 'student-api',
+        actorId: parsedStudentId,
+        actorType: 'STUDENT',
+        requestId: systemCorrelationId('vote'),
+        entity: 'votes',
+        entityId: vote.id,
+        before: null,
+        after: vote,
+        affectedRows: {
+          votes: [{ before: null, after: vote }],
+          vote_receipts: [{ before: null, after: receipt }],
+          voter_authorizations: [{ before: beforeAuth, after: afterAuth }],
+        },
+        success: true,
+        metadata: { electionId: parsedElectionId, positionId: parsedPositionId },
+      });
+    } catch (e) { console.error('[journal] VOTE_CAST failed:', e.message); }
 
     return {
       success: true,
