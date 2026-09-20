@@ -1,15 +1,30 @@
--- Migration: 057_restore_real_candidates.sql
--- 056 removed ALL election data including real student candidate applications.
--- No Postgres snapshot / Appwrite db-backups bucket / audit trail existed, so
--- bio, manifesto, phone, DOB, Aadhar, and contesting_position are unrecoverable.
--- This restores the 15 REAL candidates (proof = surviving Appwrite candidate-photos)
--- as approved applications with their student data + photo, position_id/election_id
--- NULL so they can be placed after the user creates the election manually.
--- phone is NOT NULL with no recoverable value (wipe + no backup), so a placeholder
--- '0000000000' is used; admin should correct it when reviewing candidates.
--- The 6 mock TEST candidates (who07512, ctrlplusz069, cartoonwithindian, jfjrihrje,
--- draza108, madea.official) are intentionally NOT restored.
--- Idempotent: skips students who already have an approved application.
+-- ============================================================================
+-- ⚠️  HISTORICAL RECOVERY SCRIPT — NOT AN AUTOMATIC MIGRATION — DO NOT AUTO-RUN
+-- ============================================================================
+-- File: ops/recovery/057_restore_real_candidates.sql
+-- Original: migrations/057_restore_real_candidates.sql (moved 2026-09-20)
+-- Context: migrations/056_remove_all_elections.sql deleted ALL election data
+--          including real candidate applications. No snapshot/journal existed,
+--          so bio, manifesto, phone, DOB, Aadhar are unrecoverable. This
+--          script reconstructs 15 REAL candidates from surviving Appwrite
+--          candidate-photos as approved applications with position_id/election_id
+--          NULL (to be placed manually after election creation).
+--
+-- SAFETY:
+-- - NOT part of `npm run migrate` deploy lifecycle — lives under ops/recovery/
+-- - `migrations/` is the ONLY directory executed automatically in production
+--   (see migrate.js:resolveMigrationsDir and ops/README.md)
+-- - MUST only be executed manually by an authorized operator after:
+--   1. Verifying target DATABASE_URL is correct (use --target flag, never prod by accident)
+--   2. Creating a verified pre-recovery snapshot via backupService.runBackup({snapshotType:'pre-recovery', verify:true})
+--   3. Recording journal event MIGRATION_PREFLIGHT with snapshot_id/checksum
+--   4. Obtaining explicit confirmation via ALLOW_PRODUCTION_RESTORE=true + CONFIRM token (see scripts/restore-backup.js)
+-- - Use the hardened restore flow, not `psql -f` directly, unless you have pre-backup.
+-- - Idempotent: skips students who already have an approved application.
+-- - Requires explicit operator authorization — never add to migrations/.
+-- ============================================================================
+
+-- Original recovery SQL below — execute only via explicit recovery procedure:
 
 INSERT INTO candidate_applications (
   student_id, full_name, enrollment_number, department, year, semester, section,

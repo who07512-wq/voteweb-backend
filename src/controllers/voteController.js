@@ -83,13 +83,18 @@ class VoteController {
         });
       }
 
-      // Call vote service with authenticated identity
+      // Call vote service with authenticated identity + request correlation
       const result = await voteService.castVote({
         studentId,
         electionId: electionIdInt,
         constituencyId,
         positionId,
         candidateId,
+      }, {
+        requestId: req.requestId,
+        actorId: studentId,
+        actorType: 'STUDENT',
+        source: 'student-api',
       });
 
       if (!result.success) {

@@ -43,7 +43,9 @@ function isDestructiveSql(sql, fileName = '') {
     { re: /\bdrop\s+database\b/i, msg: 'DROP DATABASE' },
     { re: /\balter\s+table\b[^;]*\bdrop\b/i, msg: 'ALTER TABLE ... DROP' },
     { re: /\bdo\s*\$\$/i, msg: 'PL/pgSQL DO $$ block' },
-    { re: /\bexecute\s+format\s*\(/i, msg: 'EXECUTE dynamic SQL' },
+    { re: /\bexecute\s+format\s*\(/i, msg: 'EXECUTE format(...) dynamic SQL' },
+    { re: /\bexecute\s+['"]/i, msg: 'EXECUTE dynamic string' },
+    { re: /\bexecute\s+.*\b(delete|truncate|drop|update)\b/i, msg: 'EXECUTE dynamic destructive' },
     { re: /\bcascade\b/i, msg: 'CASCADE' },
   ];
 

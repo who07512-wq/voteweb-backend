@@ -15,7 +15,7 @@ class CandidateApplicationService {
   /**
    * Create a new candidate application
    */
-  async create(data, studentId) {
+   async create(data, studentId, journalCtx = {}) {
     const {
       fullName,
       enrollmentNumber,
@@ -109,14 +109,14 @@ class CandidateApplicationService {
       ]
     );
 
-    // Journal: candidate application created (before=null, after=row)
+    // Journal: candidate application created (before=null, after=row) — uses real requestId if supplied
     try {
       changeJournal.record({
         operation: 'CANDIDATE_APPLICATION_CREATED',
-        source: 'student-api',
-        actorId: studentId,
-        actorType: 'STUDENT',
-        requestId: systemCorrelationId('candidate-apply'),
+        source: journalCtx.source || 'student-api',
+        actorId: journalCtx.actorId || studentId,
+        actorType: journalCtx.actorType || 'STUDENT',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-apply'),
         entity: 'candidate_applications',
         entityId: result.rows[0].id,
         before: null,
@@ -474,10 +474,10 @@ class CandidateApplicationService {
     try {
       changeJournal.record({
         operation: 'CANDIDATE_APPROVED',
-        source: context._source || 'admin-api',
+        source: context.source || context._source || 'admin-api',
         actorId: adminId,
         actorType: 'ADMIN',
-        requestId: context._requestId || systemCorrelationId('candidate-approve'),
+        requestId: context.requestId || context._requestId || systemCorrelationId('candidate-approve'),
         entity: 'candidate_applications',
         entityId: id,
         before: beforeAppRow,
@@ -509,6 +509,7 @@ class CandidateApplicationService {
    * context: { electionId?, constituencyId? }
    */
   async assignBallot(id, context = {}) {
+    // journal context may be in context.requestId
     const app = await this.getById(id);
 
     if (!app) {
@@ -705,7 +706,7 @@ class CandidateApplicationService {
   /**
    * Reject application
    */
-  async reject(id, reason, adminId) {
+  async reject(id, reason, adminId, journalCtx = {}) {
     const app = await this.getById(id);
 
     if (!app) {
@@ -768,10 +769,10 @@ class CandidateApplicationService {
     try {
       changeJournal.record({
         operation: 'CANDIDATE_REJECTED',
-        source: 'admin-api',
-        actorId: adminId,
-        actorType: 'ADMIN',
-        requestId: systemCorrelationId('candidate-reject'),
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || adminId,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-reject'),
         entity: 'candidate_applications',
         entityId: id,
         before: beforeAppReject,
@@ -792,7 +793,7 @@ class CandidateApplicationService {
   /**
    * Request changes
    */
-  async requestChanges(id, reason, adminId) {
+  async requestChanges(id, reason, adminId, journalCtx = {}) {
     const app = await this.getById(id);
 
     if (!app) {
@@ -824,10 +825,10 @@ class CandidateApplicationService {
     try {
       changeJournal.record({
         operation: 'CANDIDATE_CHANGES_REQUESTED',
-        source: 'admin-api',
-        actorId: adminId,
-        actorType: 'ADMIN',
-        requestId: systemCorrelationId('candidate-changes-requested'),
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || adminId,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-changes-requested'),
         entity: 'candidate_applications',
         entityId: id,
         before: beforeRC,
@@ -843,7 +844,7 @@ class CandidateApplicationService {
   /**
    * Resubmit application (candidate updates after changes_requested)
    */
-  async resubmit(id, data, studentId) {
+  async resubmit(id, data, studentId, journalCtx = {}) {
     const app = await this.getById(id);
 
     if (!app) {
@@ -892,10 +893,10 @@ class CandidateApplicationService {
     try {
       changeJournal.record({
         operation: 'CANDIDATE_RESUBMITTED',
-        source: 'student-api',
-        actorId: studentId,
-        actorType: 'STUDENT',
-        requestId: systemCorrelationId('candidate-resubmit'),
+        source: journalCtx.source || 'student-api',
+        actorId: journalCtx.actorId || studentId,
+        actorType: journalCtx.actorType || 'STUDENT',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-resubmit'),
         entity: 'candidate_applications',
         entityId: id,
         before: beforeResubmit,
@@ -910,7 +911,7 @@ class CandidateApplicationService {
   /**
    * Update profile after approval (only editable fields)
    */
-  async updateProfile(id, data, studentId) {
+  async updateProfile(id, data, studentId, journalCtx = {}) {
     const app = await this.getById(id);
 
     if (!app) {
@@ -953,10 +954,10 @@ class CandidateApplicationService {
     try {
       changeJournal.record({
         operation: 'CANDIDATE_PROFILE_UPDATED',
-        source: 'student-api',
-        actorId: studentId,
-        actorType: 'STUDENT',
-        requestId: systemCorrelationId('candidate-profile-update'),
+        source: journalCtx.source || 'student-api',
+        actorId: journalCtx.actorId || studentId,
+        actorType: journalCtx.actorType || 'STUDENT',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-profile-update'),
         entity: 'candidate_applications',
         entityId: id,
         before: beforeProfile,

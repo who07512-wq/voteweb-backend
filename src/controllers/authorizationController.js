@@ -165,13 +165,13 @@ class AuthorizationController {
         });
       }
 
-      // Create authorization
+      // Create authorization with request correlation
       const authorization = await authService.create({
         student_id: parseInt(student_id),
         election_id: parseInt(electionId),
         is_authorized: is_authorized !== false,
         expires_at: expires_at || null,
-      });
+      }, { requestId: req.requestId, actorId: req.user?.studentId, actorType: req.user?.role || 'ADMIN', source: 'admin-api' });
 
       res.status(201).json({ data: authorization });
     } catch (err) {
@@ -246,7 +246,7 @@ class AuthorizationController {
         updateData.expires_at = expires_at;
       }
 
-      const authorization = await authService.update(parseInt(id), updateData);
+      const authorization = await authService.update(parseInt(id), updateData, { requestId: req.requestId, actorId: req.user?.studentId, actorType: req.user?.role || 'ADMIN', source: 'admin-api' });
 
       res.json({ data: authorization });
     } catch (err) {
@@ -286,7 +286,7 @@ class AuthorizationController {
         });
       }
 
-      await authService.delete(parseInt(id));
+      await authService.delete(parseInt(id), { requestId: req.requestId, actorId: req.user?.studentId, actorType: req.user?.role || 'ADMIN', source: 'admin-api' });
 
       res.status(204).send();
     } catch (err) {

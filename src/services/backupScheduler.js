@@ -34,15 +34,21 @@ function isConfigured() {
   return Boolean(
     process.env.APPWRITE_ENDPOINT &&
       process.env.APPWRITE_PROJECT_ID &&
-      process.env.APPWRITE_API_KEY
+      (process.env.APPWRITE_BACKUP_API_KEY || process.env.APPWRITE_API_KEY)
   );
+}
+
+function retentionPreDeploy() {
+  const raw = process.env.BACKUP_RETENTION_PRE_DEPLOY_COUNT || process.env.BACKUP_RETENTION_PRE_DEPLOY;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : backupService.RETENTION_PRE_DEPLOY_KEEP;
 }
 
 async function runOnce() {
   try {
     const result = await backupService.runBackup(null, { snapshotType: 'scheduled', verify: true });
     const keep = parseInt(process.env.BACKUP_RETENTION_COUNT, 10) || backupService.RETENTION_DEFAULT;
-    const keepPre = parseInt(process.env.BACKUP_RETENTION_PRE_DEPLOY, 10) || backupService.RETENTION_PRE_DEPLOY_KEEP;
+    const keepPre = retentionPreDeploy();
     const prune = await backupService.pruneBackups(keep, { keepPreDeploy: keepPre });
     lastSuccess = { at: new Date().toISOString(), fileId: result.fileId, bytes: result.bytes, rowCounts: result.rowCounts, checksum: result.checksum };
     lastFailure = null;
@@ -96,7 +102,10 @@ function getStatus() {
     consecutiveFailures,
     retention: {
       regular: parseInt(process.env.BACKUP_RETENTION_COUNT, 10) || backupService.RETENTION_DEFAULT,
-      preDeploy: parseInt(process.env.BACKUP_RETENTION_PRE_DEPLOY, 10) || backupService.RETENTION_PRE_DEPLOY_KEEP,
+      preDeploy: retentionPreDeploy(),
+      // Explicit: COUNT-BASED (not days). 90 snapshots ≈90 days if daily. Pre-deploy kept separately.
+      retentionUnit: 'count',
+      journal: 'permanent (full term)',
     },
     journal: { retention: 'permanent (full term)' },
   };

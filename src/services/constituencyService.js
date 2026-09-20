@@ -80,7 +80,7 @@ class ConstituencyService {
   /**
    * Create a constituency and auto-create its Class Representative position.
    */
-  async create({ electionId, department, year, section, name }) {
+  async create({ electionId, department, year, section, name }, journalCtx = {}) {
     // section may be "" for section-less courses (MCA, MBA, BCom).
     if (!electionId || !department || !year || section === undefined || section === null) {
       const error = new Error('election_id, department, year, section are required.');
@@ -132,7 +132,10 @@ class ConstituencyService {
         operation: 'CONSTITUENCY_CREATED',
         source: 'admin-api',
         actorType: 'ADMIN',
-        requestId: systemCorrelationId('constituency-create'),
+        requestId: journalCtx.requestId || systemCorrelationId('constituency-create'),
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        source: journalCtx.source || 'admin-api',
         entity: 'constituencies',
         entityId: constituency.id,
         before: null,
@@ -151,7 +154,7 @@ class ConstituencyService {
   /**
    * Update a constituency (name / is_active only; identity is immutable).
    */
-  async update(id, data) {
+  async update(id, data, journalCtx = {}) {
     const { name, is_active } = data;
 
     const updates = [];
@@ -188,7 +191,7 @@ class ConstituencyService {
   /**
    * Deactivate a constituency (soft delete; keeps history).
    */
-  async deactivate(id) {
+  async deactivate(id, journalCtx = {}) {
     const result = await db.query(
       `UPDATE constituencies SET is_active = false, updated_at = NOW()
        WHERE id = $1 AND is_active = true

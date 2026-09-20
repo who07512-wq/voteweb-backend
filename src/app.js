@@ -185,7 +185,14 @@ app.get('/api/health/backup', async (req, res) => {
   const changeJournal = require('./services/changeJournal');
   const status = backupScheduler.getStatus();
   const journalHealth = await changeJournal.healthCheck().catch(() => ({ configured: false, error: 'health check failed' }));
-  // Never echo project IDs or keys
+  const journalStatus = changeJournal.getStatus ? changeJournal.getStatus() : null;
+  // snapshot age (hours) if available
+  let snapshotAgeHours = null;
+  let lastVerifiedSnapshot = null;
+  if (status.lastSuccess?.at) {
+    snapshotAgeHours = Math.round((Date.now() - new Date(status.lastSuccess.at).getTime()) / 3600000 * 10) / 10;
+    lastVerifiedSnapshot = { at: status.lastSuccess.at, checksum: status.lastSuccess.checksum || null, bytes: status.lastSuccess.bytes };
+  }
   res.json({
     status: status.configured && journalHealth.configured ? 'ok' : 'degraded',
     backup: {
@@ -195,15 +202,24 @@ app.get('/api/health/backup', async (req, res) => {
       lastSuccess: status.lastSuccess ? { at: status.lastSuccess.at, bytes: status.lastSuccess.bytes } : null,
       lastFailure: status.lastFailure,
       consecutiveFailures: status.consecutiveFailures,
+      lastVerifiedSnapshot,
+      snapshotAgeHours,
+      checksumState: status.lastSuccess?.checksum ? 'verified' : 'unknown',
     },
     journal: {
       configured: journalHealth.configured,
       bucketId: journalHealth.bucketId || null,
       error: journalHealth.error || null,
+      backlogSize: journalStatus?.backlogSize || 0,
+      lastSuccessAt: journalStatus?.lastSuccessAt || null,
+      lastFailureAt: journalStatus?.lastFailureAt || null,
+      failureCount: journalStatus?.failureCount || 0,
+      oldestPending: journalStatus?.oldestPending || null,
     },
     migrationSafety: {
       allowDestructiveMigrations: process.env.ALLOW_DESTRUCTIVE_MIGRATIONS || (process.env.NODE_ENV === 'production' ? 'false (default prod)' : 'true (default dev)'),
       nodeEnv: process.env.NODE_ENV || 'development',
+      migrationDir: 'migrations/ (auto), ops/recovery/ (manual), test/migrations/ (isolated)',
     },
     requestId: req.requestId,
   });
@@ -340,13 +356,17 @@ app.get('/api/v1/admin/backup/status', requireAdmin, async (req, res) => {
   try {
     const schedulerStatus = backupScheduler.getStatus();
     const journalHealth = await changeJournal.healthCheck();
+    const journalStatus = changeJournal.getStatus ? changeJournal.getStatus() : null;
     let latest = null;
     let verification = null;
+    let snapshotAgeHours = null;
     try {
       const files = await backupService.listBackups();
       if (files.length) {
         latest = files[0];
-        // quick verification of latest (checksum) without exposing contents
+        if (latest.createdAt) {
+          snapshotAgeHours = Math.round((Date.now() - new Date(latest.createdAt).getTime()) / 3600000 * 10) / 10;
+        }
         const v = await backupService.verifyBackup(latest.fileId);
         verification = { valid: v.valid, error: v.error || null, checksum: v.checksum || null, rowCounts: v.rowCounts || null };
       }
@@ -355,13 +375,18 @@ app.get('/api/v1/admin/backup/status', requireAdmin, async (req, res) => {
     }
     res.json({
       scheduler: schedulerStatus,
-      journal: journalHealth,
-      latestSnapshot: latest,
+      journal: { health: journalHealth, status: journalStatus },
+      latestSnapshot: latest ? { ...latest, ageHours: snapshotAgeHours } : null,
       latestVerification: verification,
+      snapshotAgeHours,
       policy: backupService.BACKUP_POLICY,
+      retention: schedulerStatus.retention,
       buckets: {
         backups: backupService.BACKUP_BUCKET_DEFAULT,
         journal: changeJournal.JOURNAL_BUCKET_DEFAULT,
+      },
+      migrationSafety: {
+        allowDestructive: process.env.ALLOW_DESTRUCTIVE_MIGRATIONS || (process.env.NODE_ENV === 'production' ? 'false (default prod)' : 'true (default dev)'),
       },
     });
   } catch (err) {

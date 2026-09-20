@@ -40,10 +40,26 @@ services:
         value: 6a961a3200335ef36ba8
       - key: APPWRITE_API_KEY
         sync: false
+      # Least-privilege backup/journal keys (prefer separate keys; fallback to APPWRITE_API_KEY if not set)
+      - key: APPWRITE_BACKUP_API_KEY
+        sync: false
+      - key: APPWRITE_JOURNAL_API_KEY
+        sync: false
       - key: APPWRITE_PHOTOS_BUCKET
         value: candidate-photos
       - key: APPWRITE_PROFILE_BUCKET
         value: profile-images
+      - key: APPWRITE_BACKUPS_BUCKET
+        value: db-backups
+      - key: APPWRITE_JOURNAL_BUCKET
+        value: db-change-journal
+      # Backup retention: COUNT-BASED (90 snapshots ≈90 days if daily), pre-deploy 30 separate
+      - key: BACKUP_RETENTION_COUNT
+        value: "90"
+      - key: BACKUP_RETENTION_PRE_DEPLOY_COUNT
+        value: "30"
+      - key: ALLOW_DESTRUCTIVE_MIGRATIONS
+        value: "false"
     healthCheckPath: /api/health
     autoDeploy: true
  
