@@ -147,7 +147,7 @@ class ElectionController {
         description: description?.trim() || null,
         start_time: start_time ? new Date(start_time).toISOString() : null,
         end_time: end_time ? new Date(end_time).toISOString() : null,
-      });
+      }, { requestId: req.requestId, actorId: req.user?.studentId, actorType: 'ADMIN', source: 'admin-api' });
 
       // Audit log: election created
       await auditLog('ELECTION_CREATED', {
@@ -234,7 +234,7 @@ class ElectionController {
         description: description !== undefined ? (description?.trim() || null) : undefined,
         start_time: start_time ? new Date(start_time).toISOString() : undefined,
         end_time: end_time ? new Date(end_time).toISOString() : undefined,
-      });
+      }, { requestId: req.requestId, actorId: req.user?.studentId, actorType: 'ADMIN', source: 'admin-api' });
 
       if (result === null) {
         return res.status(404).json({
@@ -287,7 +287,7 @@ class ElectionController {
         });
       }
 
-      const result = await electionService.updateStatus(parseInt(id), status);
+      const result = await electionService.updateStatus(parseInt(id), status, { requestId: req.requestId, actorId: req.user?.studentId, actorType: 'ADMIN', source: 'admin-api' });
 
       if (result.error === 'NOT_FOUND') {
         return res.status(404).json({

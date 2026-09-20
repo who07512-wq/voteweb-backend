@@ -69,8 +69,8 @@ const BACKUP_POLICY = {
   // Students password_hash IS included (needed for login continuity) — bucket is PRIVATE
 };
 
-const RETENTION_DEFAULT = 90; // recommended 90+ snapshots or 90 days; configurable via BACKUP_RETENTION_COUNT
-const RETENTION_PRE_DEPLOY_KEEP = 30; // keep last 30 pre-deploy snapshots extra (separate from regular)
+const RETENTION_DEFAULT = 90; // COUNT-BASED: keep last 90 snapshots (approx 90 days if daily). Config via BACKUP_RETENTION_COUNT (not days). See backupScheduler.js.
+const RETENTION_PRE_DEPLOY_KEEP = 30; // COUNT-BASED: keep last 30 pre-deploy/pre-destructive snapshots separately (BACKUP_RETENTION_PRE_DEPLOY_COUNT). 0 = keep all (recommended for term).
 let inFlight = null;
 
 function getGitCommit() {
@@ -85,7 +85,8 @@ function getGitCommit() {
 function backupConfig() {
   const endpoint = process.env.APPWRITE_ENDPOINT;
   const projectId = process.env.APPWRITE_PROJECT_ID;
-  const apiKey = process.env.APPWRITE_API_KEY;
+  // Least-privilege: prefer dedicated backup key, fallback to generic for backward compat
+  const apiKey = process.env.APPWRITE_BACKUP_API_KEY || process.env.APPWRITE_API_KEY;
   if (!endpoint || !projectId || !apiKey) {
     const err = new Error('Backup storage is not configured (missing Appwrite env).');
     err.status = 503;
@@ -388,10 +389,22 @@ async function restoreSnapshot(snapshot, pool) {
     err.code = 'INVALID_SNAPSHOT';
     throw err;
   }
-  // Verify integrity before restore
+  // Verify integrity before restore (fail-closed)
   const integrity = verifySnapshotIntegrity(snapshot);
   if (!integrity.valid) {
-    console.warn(`[restore] snapshot integrity warning: ${integrity.error} — proceed with caution`);
+    const err = new Error(`Snapshot integrity failed: ${integrity.error}`);
+    err.code = 'RESTORE_CHECKSUM_FAILED';
+    err.status = 400;
+    throw err;
+  }
+  // Also ensure core tables present
+  const expectedCore = ['elections', 'students', 'constituencies', 'positions', 'candidates', 'candidate_applications', 'votes', 'voter_authorizations'];
+  const missing = expectedCore.filter(t => !(t in (snapshot.tables || {})));
+  if (missing.length) {
+    const err = new Error(`Snapshot missing core tables: ${missing.join(', ')}`);
+    err.code = 'RESTORE_MISSING_TABLES';
+    err.status = 400;
+    throw err;
   }
   const dbPool = pool || require('../db').pool;
   const client = await dbPool.connect();

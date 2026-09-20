@@ -71,7 +71,7 @@ class CandidateApplicationController {
         });
       }
 
-      const application = await candidateAppService.create(applicationData, studentId);
+      const application = await candidateAppService.create(applicationData, studentId, { requestId: req.requestId, actorId: studentId, actorType: 'STUDENT', source: 'student-api' });
 
       return res.status(201).json({
         success: true,
@@ -185,7 +185,7 @@ class CandidateApplicationController {
       if (bio !== undefined) updates.bio = bio;
       if (manifesto !== undefined) updates.manifesto = manifesto;
 
-      const updated = await candidateAppService.updateProfile(application.id, updates, studentId);
+      const updated = await candidateAppService.updateProfile(application.id, updates, studentId, { requestId: req.requestId, actorId: studentId, actorType: 'STUDENT', source: 'student-api' });
 
       return res.json({
         success: true,
@@ -226,7 +226,7 @@ class CandidateApplicationController {
         profilePhotoUrl,
         bio,
         manifesto,
-      });
+      }, studentId, { requestId: req.requestId, actorId: studentId, actorType: 'STUDENT', source: 'student-api' });
 
       return res.json({
         success: true,
@@ -317,7 +317,7 @@ class CandidateApplicationController {
         });
       }
 
-      const updated = await candidateAppService.approve(id, adminId, req.body);
+      const updated = await candidateAppService.approve(id, adminId, { ...req.body, requestId: req.requestId, source: 'admin-api' });
 
       return res.json({
         success: true,
@@ -362,7 +362,7 @@ class CandidateApplicationController {
         });
       }
 
-      const updated = await candidateAppService.reject(id, reason, adminId);
+      const updated = await candidateAppService.reject(id, reason, adminId, { requestId: req.requestId, actorId: adminId, actorType: 'ADMIN', source: 'admin-api' });
 
       return res.json({
         success: true,
@@ -407,7 +407,7 @@ class CandidateApplicationController {
         });
       }
 
-      const updated = await candidateAppService.requestChanges(id, reason, adminId);
+      const updated = await candidateAppService.requestChanges(id, reason, adminId, { requestId: req.requestId, actorId: adminId, actorType: 'ADMIN', source: 'admin-api' });
 
       return res.json({
         success: true,
@@ -427,7 +427,7 @@ class CandidateApplicationController {
     try {
       const { id } = req.params;
 
-      const updated = await candidateAppService.assignBallot(id, req.body || {});
+      const updated = await candidateAppService.assignBallot(id, { ...(req.body || {}), requestId: req.requestId, source: 'admin-api' });
 
       return res.json({
         success: true,

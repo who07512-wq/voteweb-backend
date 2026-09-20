@@ -20,6 +20,7 @@
 require('dotenv').config();
 
 const backupService = require('../src/services/backupService');
+const restoreService = require('../src/services/restoreService');
 const changeJournal = require('../src/services/changeJournal');
 const crypto = require('node:crypto');
 
@@ -96,22 +97,9 @@ async function main() {
     }
   }
 
-  // Fresh backup of target BEFORE restore (fail-closed)
-  console.log('Creating fresh backup of TARGET before restore (mandatory)...');
-  let preRestoreBackup = null;
-  try {
-    // Use targetUrl's pool directly? fallback to backupService which uses DATABASE_URL env (already set)
-    // Ensure backupService sees the correct target: temporarily set env if --target used
-    const originalUrl = process.env.DATABASE_URL;
-    if (getArg('--target')) process.env.DATABASE_URL = targetUrl;
-    preRestoreBackup = await backupService.runBackup(null, { snapshotType: 'pre-restore', verify: true });
-    console.log(`✓ Pre-restore snapshot: ${preRestoreBackup.fileId} (${preRestoreBackup.bytes} bytes, verified:${preRestoreBackup.verified})`);
-    if (getArg('--target')) process.env.DATABASE_URL = originalUrl;
-  } catch (err) {
-    console.error(`⛔ Pre-restore backup FAILED: ${err.message}`);
-    console.error('Restore blocked — would have overwritten target without a safety backup.');
-    process.exit(1);
-  }
+  // Delegate to hardened service for pre-restore backup, verification, prod guards
+  // Creating fresh backup of TARGET before restore — delegated to restoreService.safeRestore (service-layer fail-closed)
+  // (service layer enforces all checks so CLI cannot bypass)
 
   const skipConfirm = hasArg('--yes') || !process.stdin.isTTY;
   if (!skipConfirm) {
@@ -137,46 +125,19 @@ async function main() {
     console.log('Production --yes restore acknowledged via ALLOW_PRODUCTION_RESTORE + --confirm');
   }
 
-  // Journal the restore intent (before destructive)
-  try {
-    changeJournal.record({
-      operation: 'RESTORE_STARTED',
-      source: 'restore',
-      actorType: 'SYSTEM',
-      entity: 'db_restore',
-      entityId: snapshot.snapshot_id,
-      before: null,
-      after: { target: targetUrl.replace(/:\/\/[^@]+@/, '://***@'), snapshotId: snapshot.snapshot_id, checksum: snapshot.checksum, preBackupId: preRestoreBackup?.fileId },
-      success: true,
-      metadata: { snapshotId: snapshot.snapshot_id, preRestoreBackupId: preRestoreBackup?.fileId, totalRows },
-    });
-    await changeJournal.flush();
-  } catch (e) { console.warn('[journal] RESTORE_STARTED failed:', e.message); }
-
   console.log('');
-  console.log('Restoring... (TRUNCATE + insert in FK order)');
-  const restored = await backupService.restoreSnapshot(snapshot);
+  console.log('Restoring via hardened service (pre-restore backup + verification)...');
+  const { restored, preBackup } = await restoreService.safeRestore(snapshot, null, {
+    target: targetUrl,
+    confirmToken: getArg('--confirm') || process.env.CONFIRM_PRODUCTION_RESTORE,
+    allowProd: process.env.ALLOW_PRODUCTION_RESTORE === 'true',
+  });
   const totalRestored = Object.values(restored).reduce((a, b) => a + b, 0);
   console.log('');
-  console.log(`✓ Restore complete: ${totalRestored} rows across ${Object.keys(restored).length} tables.`);
+  console.log(`✓ Restore complete: ${totalRestored} rows across ${Object.keys(restored).length} tables (pre-backup ${preBackup.fileId}).`);
   for (const [table, n] of Object.entries(restored)) {
     console.log(`  ${table}: ${n}`);
   }
-
-  try {
-    changeJournal.record({
-      operation: 'RESTORE_COMPLETED',
-      source: 'restore',
-      actorType: 'SYSTEM',
-      entity: 'db_restore',
-      entityId: snapshot.snapshot_id,
-      before: null,
-      after: { restored, totalRestored, snapshotId: snapshot.snapshot_id },
-      success: true,
-      metadata: { snapshotId: snapshot.snapshot_id, preRestoreBackupId: preRestoreBackup?.fileId },
-    });
-    await changeJournal.flush();
-  } catch {}
 
   process.exit(0);
 }
