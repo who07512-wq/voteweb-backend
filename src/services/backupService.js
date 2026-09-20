@@ -1,36 +1,86 @@
 /**
- * Database Backup Service
+ * Database Backup Service — Hardened (Layer B)
  *
- * Exports every table's rows to a single JSON snapshot and uploads it to
- * Appwrite Storage (bucket `db-backups`). Protects against Render's free
- * Postgres expiry/wipe: snapshots live off-host and can be restored with
- * `npm run db:restore`.
+ * Exports every business-relevant table's rows to a single JSON snapshot and uploads
+ * it to Appwrite Storage bucket `db-backups` (PRIVATE). Protects against Render's
+ * free Postgres expiry/wipe and destructive migrations: snapshots live off-host and
+ * can be restored with `npm run db:restore`.
+ *
+ * Backup Policy (explicit, documented):
+ * ---------------------------------------------------------------------------
+ * Category              | Tables                                          | Included | Rationale
+ * ----------------------|-----------------------------------------------|----------|----------------------------------------------
+ * Business data         | elections, constituencies, positions,         | YES      | Complete recoverable application state
+ *                       | candidates, candidate_applications, votes,    |          |
+ *                       | vote_receipts, voter_authorizations,          |          |
+ *                       | announcements, support_requests, notifications|          |
+ *                       | students (with password_hash required)        | YES      | Required for login post-restore (hash, not plain)
+ * Audit data            | audit_logs, auth_audit_logs                   | YES      | Queryable operational audit; kept separately from off-host journal
+ * Authentication state  | sessions                                      | NO       | Ephemeral — expires in hours, not required for recovery, reduces secret exposure
+ * Ephemeral security    | mfa_challenges, otp_challenges                | NO       | One-time codes, short TTL (5m), not needed for recovery
+ * Migrations metadata   | migrations                                    | YES      | Required to know schema version for restore validation
+ * System                | pg internal tables                            | NO       | Not needed
+ * ---------------------------------------------------------------------------
+ * Secrets handling: password_hash is a hash (not reversible) and IS included for
+ * recovery. Raw secrets (OTP values, Aadhar plaintext is encrypted? but we store
+ * as-is for recovery — bucket is PRIVATE and checksum-verified). Appwrite buckets
+ * must be PRIVATE (no Permission.read(Role.any())).
+ *
+ * Snapshot includes: format, version, snapshot_id, created_at, git_commit, max_migration,
+ * row_counts, tables, checksum (SHA-256 of canonical JSON).
+ * Verification: after upload, download and validate checksum + row counts.
+ *
+ * Retention:
+ * - journal: permanent (not pruned here; managed by changeJournal bucket policy)
+ * - snapshots: configurable, default 90 (RETENTION_DEFAULT). Recommended 90+ days.
+ * - pre-deploy / pre-destructive snapshots: tagged type=pre-deploy|pre-destructive, retained
+ *   separately — not pruned by default retention unless explicitly allowed (keep=0 means keep all).
  *
  * Design notes:
- * - Plain SQL `row_to_json` reads through the existing pg pool — no native
- *   pg_dump binary (unavailable on Render's runtime image), no new deps.
- * - Snapshots include schema version (max migration) + row counts so the
- *   restore path can warn on mismatched schemas.
- * - Restore is data-only (schema must exist via migrations), FK-order-aware
- *   via a topological sort of pg_constraint dependencies.
- * - Retention: keeps the newest N snapshots, deletes older ones.
- * - Never runs concurrently with itself (in-process single-flight lock).
+ * - Plain SQL reads through existing pg pool — no pg_dump binary.
+ * - Restore is data-only (schema must exist via migrations), FK-order-aware.
+ * - Single-flight lock prevents concurrent runs.
  */
 
-const { Client, Storage, ID, Permission, Role } = require('node-appwrite');
+const crypto = require('node:crypto');
+const { Client, Storage, ID } = require('node-appwrite');
 const { InputFile } = require('node-appwrite/file');
 
 const BACKUP_BUCKET_DEFAULT = 'db-backups';
 
-/** Tables excluded from snapshots (session/state noise, not user data). */
+/**
+ * Explicit backup policy: which tables to exclude with rationale.
+ * Ephemeral security state is excluded; migrations IS now included.
+ */
 const EXCLUDED_TABLES = new Set([
-  'sessions',
-  'mfa_challenges',
-  'otp_challenges',
-  'migrations',
+  'sessions',        // ephemeral: TTL 8h, not required for recovery
+  'mfa_challenges',  // ephemeral OTP/MFA challenges
+  'otp_challenges',  // ephemeral OTP challenges
 ]);
 
-const RETENTION_DEFAULT = 14;
+const BACKUP_POLICY = {
+  description: 'A-to-Z recoverable business state; ephemeral secrets excluded',
+  includedCategories: ['business', 'audit', 'migrations_metadata', 'students_auth_hash'],
+  excludedCategories: {
+    sessions: 'ephemeral session tokens — not required, short TTL',
+    mfa_challenges: 'ephemeral MFA challenges',
+    otp_challenges: 'ephemeral OTP challenges',
+  },
+  // Students password_hash IS included (needed for login continuity) — bucket is PRIVATE
+};
+
+const RETENTION_DEFAULT = 90; // recommended 90+ snapshots or 90 days; configurable via BACKUP_RETENTION_COUNT
+const RETENTION_PRE_DEPLOY_KEEP = 30; // keep last 30 pre-deploy snapshots extra (separate from regular)
+let inFlight = null;
+
+function getGitCommit() {
+  try {
+    const { execSync } = require('node:child_process');
+    return execSync('git rev-parse HEAD', { encoding: 'utf8', timeout: 2000 }).trim();
+  } catch {
+    return process.env.GIT_COMMIT || process.env.RENDER_GIT_COMMIT || 'unknown';
+  }
+}
 
 function backupConfig() {
   const endpoint = process.env.APPWRITE_ENDPOINT;
@@ -51,8 +101,6 @@ function backupConfig() {
 
 /**
  * List non-excluded, real tables (base + partitioned) in `public`.
- * @param {import('pg').Pool} pool
- * @returns {Promise<Array<{name: string, columns: string[]}>>}
  */
 async function listTables(pool) {
   const { rows } = await pool.query(
@@ -71,15 +119,7 @@ async function listTables(pool) {
     .map((r) => ({ name: r.name, columns: r.columns }));
 }
 
-/**
- * Read all rows of a table as plain JSON values.
- * @param {import('pg').Pool} pool
- * @param {string} table
- * @param {string[]} columns
- * @returns {Promise<Array<Object>>}
- */
 async function readTableRows(pool, table, columns) {
-  // identifier-safe: table + column names come from pg_catalog, not user input
   const cols = columns.map((c) => `"${c}"`).join(', ');
   const { rows } = await pool.query(
     `SELECT to_jsonb(t) AS row FROM (SELECT ${cols} FROM "${table}") t`
@@ -88,11 +128,11 @@ async function readTableRows(pool, table, columns) {
 }
 
 /**
- * Build the snapshot document.
+ * Build snapshot document with metadata and checksum.
  * @param {import('pg').Pool} pool
- * @returns {Promise<Object>}
+ * @param {Object} [opts] - { snapshotType: 'scheduled' | 'pre-deploy' | 'pre-destructive' | 'manual', gitCommit }
  */
-async function buildSnapshot(pool) {
+async function buildSnapshot(pool, opts = {}) {
   const tables = await listTables(pool);
   const data = {};
   const rowCountByTable = {};
@@ -105,44 +145,125 @@ async function buildSnapshot(pool) {
     `SELECT COALESCE(MAX(id), 0)::int AS max_migration FROM migrations`
   );
   const maxMigration = migRows[0]?.max_migration ?? 0;
-  return {
+  const { rows: migNames } = await pool.query(`SELECT name FROM migrations ORDER BY id`);
+  const snapshotId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+  const gitCommit = opts.gitCommit || getGitCommit();
+  const snapshot = {
     format: 'voteweb-db-snapshot',
-    version: 1,
+    version: 2,
+    snapshot_id: snapshotId,
+    snapshot_type: opts.snapshotType || 'scheduled',
     created_at: new Date().toISOString(),
+    git_commit: gitCommit,
     max_migration: maxMigration,
+    migration_names: migNames.map(r => r.name),
     row_counts: rowCountByTable,
     tables: data,
   };
+  // checksum over canonical JSON without checksum field itself
+  const canonical = JSON.stringify(snapshot);
+  const checksum = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+  snapshot.checksum = checksum;
+  snapshot.checksum_algo = 'sha256';
+  return snapshot;
+}
+
+function computeChecksum(snapshotWithoutChecksum) {
+  const clone = { ...snapshotWithoutChecksum };
+  delete clone.checksum;
+  delete clone.checksum_algo;
+  const canonical = JSON.stringify(clone);
+  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+}
+
+function verifySnapshotIntegrity(snapshot) {
+  if (!snapshot || snapshot.format !== 'voteweb-db-snapshot') {
+    return { valid: false, error: 'Invalid format' };
+  }
+  if (!snapshot.checksum) {
+    return { valid: false, error: 'Missing checksum' };
+  }
+  const expected = computeChecksum(snapshot);
+  if (expected !== snapshot.checksum) {
+    return { valid: false, error: `Checksum mismatch: expected ${expected}, got ${snapshot.checksum}` };
+  }
+  // row_counts vs actual tables length
+  for (const [tbl, cnt] of Object.entries(snapshot.row_counts || {})) {
+    const actual = (snapshot.tables?.[tbl] || []).length;
+    if (actual !== cnt) {
+      return { valid: false, error: `Row count mismatch for ${tbl}: expected ${cnt}, got ${actual}` };
+    }
+  }
+  return { valid: true };
 }
 
 /**
- * Run a full snapshot + upload. Single-flight: concurrent callers share the
- * same in-progress run.
- * @param {import('pg').Pool} [pool] - optional pool override (tests)
- * @returns {Promise<{fileId: string, url: string, bytes: number, rowCounts: Object, createdAt: string}>}
+ * Run full snapshot + upload (PRIVATE bucket) + verify. Single-flight.
+ * @param {import('pg').Pool} [pool]
+ * @param {Object} [opts] - { snapshotType, verify: boolean }
  */
-let inFlight = null;
-async function runBackup(pool) {
+async function runBackup(pool, opts = {}) {
   if (inFlight) return inFlight;
   inFlight = (async () => {
     const { client, bucketId } = backupConfig();
     const storage = new Storage(client);
     const dbPool = pool || require('../db').pool;
-    const snapshot = await buildSnapshot(dbPool);
+    const snapshot = await buildSnapshot(dbPool, { snapshotType: opts.snapshotType || 'scheduled', gitCommit: opts.gitCommit });
     const json = JSON.stringify(snapshot);
-    const fileName = `voteweb-snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const bytes = Buffer.byteLength(json, 'utf8');
+    // File name includes type + timestamp + snapshot_id for immutability
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileName = `voteweb-snapshot-${snapshot.snapshot_type}-${ts}-${snapshot.snapshot_id.slice(0, 8)}.json`;
+    // upload PRIVATE — no Permission.read(Role.any())
     const file = await storage.createFile(
       bucketId,
       ID.unique(),
-      InputFile.fromBuffer(Buffer.from(json, 'utf8'), fileName),
-      [Permission.read(Role.any())]
+      InputFile.fromBuffer(Buffer.from(json, 'utf8'), fileName)
     );
+
+    // Verification: download and validate checksum if requested (default true for pre-deploy)
+    let verified = false;
+    let verifyError = null;
+    if (opts.verify !== false) {
+      try {
+        const downloaded = await downloadBackup(file.$id, pool);
+        const v = verifySnapshotIntegrity(downloaded);
+        if (!v.valid) throw new Error(v.error);
+        // Also verify size/checksum matches uploaded
+        if (downloaded.snapshot_id !== snapshot.snapshot_id) throw new Error('Snapshot ID mismatch after round-trip');
+        verified = true;
+      } catch (e) {
+        verifyError = e.message;
+        // Do not delete the file — it may still be useful — but report unverified
+        console.error(`[backup] verification failed for ${file.$id}: ${e.message}`);
+        if (opts.snapshotType === 'pre-destructive' || opts.snapshotType === 'pre-deploy') {
+          // For destructive gates, failed verification MUST be treated as backup failure
+          throw new Error(`Backup verification failed: ${e.message}`);
+        }
+      }
+    } else {
+      // Even without verify, ensure file exists via getFile
+      try {
+        await storage.getFile(bucketId, file.$id);
+        verified = true;
+      } catch (e) {
+        verifyError = e.message;
+      }
+    }
+
     return {
       fileId: file.$id,
+      bucketId,
       url: `${process.env.APPWRITE_ENDPOINT}/storage/buckets/${bucketId}/files/${file.$id}/view?project=${process.env.APPWRITE_PROJECT_ID}`,
-      bytes: Buffer.byteLength(json, 'utf8'),
+      bytes,
       rowCounts: snapshot.row_counts,
       createdAt: snapshot.created_at,
+      snapshotId: snapshot.snapshot_id,
+      checksum: snapshot.checksum,
+      gitCommit: snapshot.git_commit,
+      snapshotType: snapshot.snapshot_type,
+      verified,
+      verifyError,
     };
   })();
   try {
@@ -153,60 +274,79 @@ async function runBackup(pool) {
 }
 
 /**
- * List existing snapshots in the backup bucket (newest first).
- * @returns {Promise<Array<{fileId: string, name: string, bytes: number, createdAt: string}>>}
+ * Separate retention for pre-deploy snapshots: keep last N pre-deploy + N regular.
+ * Regular prune only touches snapshots matching voteweb-snapshot-scheduled or manual.
  */
-async function listBackups() {
+async function listBackups(filterType = null) {
   const { client, bucketId } = backupConfig();
   const storage = new Storage(client);
   const res = await storage.listFiles(bucketId, [], 100);
-  return (res.files || [])
+  let files = (res.files || [])
     .filter((f) => f.name.startsWith('voteweb-snapshot-'))
     .map((f) => ({
       fileId: f.$id,
       name: f.name,
       bytes: f.sizeOriginal,
       createdAt: f.$createdAt,
+      snapshotType: f.name.includes('pre-destructive') ? 'pre-destructive' : f.name.includes('pre-deploy') ? 'pre-deploy' : 'scheduled',
     }))
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  if (filterType) files = files.filter(f => f.snapshotType === filterType);
+  return files;
 }
 
-/**
- * Download a snapshot's JSON.
- * @param {string} fileId
- * @returns {Promise<Object>}
- */
-async function downloadBackup(fileId) {
+async function downloadBackup(fileId, poolOverride) {
   const { client, bucketId } = backupConfig();
   const storage = new Storage(client);
   const res = await storage.getFileDownload(bucketId, fileId);
-  // node-appwrite v29 returns a Response-like object with arrayBuffer()
   const buf = Buffer.from(await res.arrayBuffer());
   return JSON.parse(buf.toString('utf8'));
 }
 
 /**
- * Delete snapshots beyond the newest `keep` ones.
- * @param {number} [keep]
- * @returns {Promise<{deleted: number, kept: number}>}
+ * Prune snapshots beyond `keep` (default RETENTION_DEFAULT). Pre-deploy snapshots have separate retention
+ * via `keepPreDeploy` (default RETENTION_PRE_DEPLOY_KEEP). If keep=0, keep all.
  */
-async function pruneBackups(keep = RETENTION_DEFAULT) {
+async function pruneBackups(keep = RETENTION_DEFAULT, opts = {}) {
+  const keepPreDeploy = opts.keepPreDeploy ?? RETENTION_PRE_DEPLOY_KEEP;
   const { client, bucketId } = backupConfig();
   const storage = new Storage(client);
-  const files = await listBackups();
-  const old = files.slice(keep);
-  for (const f of old) {
-    await storage.deleteFile(bucketId, f.fileId);
+  const all = await listBackups();
+  const regular = all.filter(f => f.snapshotType === 'scheduled' || f.snapshotType === 'manual');
+  const preDeploy = all.filter(f => f.snapshotType === 'pre-deploy' || f.snapshotType === 'pre-destructive');
+
+  let deleted = 0;
+  if (keep > 0 && regular.length > keep) {
+    const old = regular.slice(keep);
+    for (const f of old) {
+      await storage.deleteFile(bucketId, f.fileId);
+      deleted++;
+    }
   }
-  return { deleted: old.length, kept: files.length - old.length };
+  if (keepPreDeploy > 0 && preDeploy.length > keepPreDeploy) {
+    const old = preDeploy.slice(keepPreDeploy);
+    for (const f of old) {
+      await storage.deleteFile(bucketId, f.fileId);
+      deleted++;
+    }
+  }
+  const kept = all.length - deleted;
+  return { deleted, kept, regular: regular.length, preDeploy: preDeploy.length };
 }
 
-/**
- * Topologically sort tables by FK dependencies (parents first).
- * @param {import('pg').Pool} pool
- * @param {string[]} tableNames
- * @returns {Promise<string[]>}
- */
+async function verifyBackup(fileId) {
+  const snapshot = await downloadBackup(fileId);
+  const integrity = verifySnapshotIntegrity(snapshot);
+  // Validate expected tables exist (at least core business tables)
+  const expectedCore = ['elections', 'students', 'constituencies', 'positions', 'candidates', 'candidate_applications', 'votes', 'voter_authorizations'];
+  const missing = expectedCore.filter(t => !(t in (snapshot.tables || {})));
+  if (missing.length) {
+    return { valid: false, error: `Missing core tables: ${missing.join(', ')}`, snapshot };
+  }
+  if (!integrity.valid) return { valid: false, error: integrity.error, snapshot };
+  return { valid: true, snapshot, rowCounts: snapshot.row_counts, checksum: snapshot.checksum };
+}
+
 async function orderTablesByDependencies(pool, tableNames) {
   const wanted = new Set(tableNames);
   const { rows } = await pool.query(
@@ -222,7 +362,6 @@ async function orderTablesByDependencies(pool, tableNames) {
       deps.get(child).push(parent);
     }
   }
-  // Kahn's algorithm; fall back to alphabetical for cycles (self-FKs handled above)
   const ordered = [];
   const remaining = new Map(deps);
   while (remaining.size) {
@@ -242,15 +381,6 @@ async function orderTablesByDependencies(pool, tableNames) {
   return ordered;
 }
 
-/**
- * Restore rows from a snapshot into the database. Data-only: assumes the
- * schema already exists (migrations already applied). Truncates every table
- * present in the snapshot (single statement = FK-safe), inserts in FK order,
- * then resyncs identity sequences.
- * @param {Object} snapshot
- * @param {import('pg').Pool} [pool]
- * @returns {Promise<Object>} table -> rows restored
- */
 async function restoreSnapshot(snapshot, pool) {
   if (!snapshot || snapshot.format !== 'voteweb-db-snapshot') {
     const err = new Error('Not a valid voteweb-db-snapshot file.');
@@ -258,28 +388,27 @@ async function restoreSnapshot(snapshot, pool) {
     err.code = 'INVALID_SNAPSHOT';
     throw err;
   }
+  // Verify integrity before restore
+  const integrity = verifySnapshotIntegrity(snapshot);
+  if (!integrity.valid) {
+    console.warn(`[restore] snapshot integrity warning: ${integrity.error} — proceed with caution`);
+  }
   const dbPool = pool || require('../db').pool;
   const client = await dbPool.connect();
   const tables = snapshot.tables || {};
   const restored = {};
   try {
     await client.query('BEGIN');
-
-    // Only restore tables that actually exist in the current schema
     const dbTables = await listTables(dbPool);
     const existing = new Set(dbTables.map((t) => t.name));
     const present = Object.keys(tables).filter(
       (t) => existing.has(t) && Array.isArray(tables[t])
     );
-
-    // Truncate everything being restored in ONE statement (FK-safe within a
-    // single TRUNCATE). CASCADE guards against tables not in the snapshot.
     if (present.length) {
       await client.query(
         `TRUNCATE TABLE ${present.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`
       );
     }
-
     const ordered = await orderTablesByDependencies(dbPool, present);
     for (const name of ordered) {
       const rows = tables[name] || [];
@@ -297,10 +426,6 @@ async function restoreSnapshot(snapshot, pool) {
         restored[name] += rowCount || 0;
       }
     }
-
-    // Resync identity/serial sequences past restored explicit ids.
-    // Guards run as plain SELECTs first — a failed query inside the
-    // transaction would abort it, so never fire setval speculatively.
     for (const name of ordered) {
       const { rows: hasId } = await client.query(
         `SELECT 1 FROM information_schema.columns
@@ -314,13 +439,12 @@ async function restoreSnapshot(snapshot, pool) {
         [name]
       );
       const seq = seqRows[0]?.seq;
-      if (!seq) continue; // no serial/identity on `id`
+      if (!seq) continue;
       await client.query(
         `SELECT setval($1, COALESCE((SELECT MAX(id) FROM "${name}"), 1), TRUE)`,
         [seq]
       );
     }
-
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -339,6 +463,13 @@ module.exports = {
   restoreSnapshot,
   buildSnapshot,
   listTables,
+  verifyBackup,
+  verifySnapshotIntegrity,
+  computeChecksum,
+  backupConfig,
   RETENTION_DEFAULT,
+  RETENTION_PRE_DEPLOY_KEEP,
   EXCLUDED_TABLES,
+  BACKUP_POLICY,
+  BACKUP_BUCKET_DEFAULT,
 };

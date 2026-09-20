@@ -4,6 +4,8 @@
  */
 
 const db = require('../db');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 class AuthorizationService {
   /**
@@ -76,7 +78,7 @@ class AuthorizationService {
   /**
    * Create a new authorization (election-wide)
    */
-  async create(data) {
+  async create(data, journalCtx = {}) {
     const { student_id, election_id, is_authorized = true, expires_at } = data;
 
     const result = await db.query(
@@ -90,14 +92,28 @@ class AuthorizationService {
         expires_at || null,
       ]
     );
-
+    try {
+      changeJournal.record({
+        operation: 'AUTHORIZATION_CREATED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('auth-create'),
+        entity: 'voter_authorizations',
+        entityId: result.rows[0].id,
+        before: null,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] AUTHORIZATION_CREATED failed:', e.message); }
     return result.rows[0];
   }
 
   /**
    * Update an authorization
    */
-  async update(id, data) {
+  async update(id, data, journalCtx = {}) {
+    const beforeAuth = await this.findByIdSimple(id);
     const { is_authorized, expires_at } = data;
 
     const updates = [];
@@ -125,17 +141,46 @@ class AuthorizationService {
 
     const query = `UPDATE voter_authorizations SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
     const result = await db.query(query, params);
+    try {
+      changeJournal.record({
+        operation: 'AUTHORIZATION_UPDATED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('auth-update'),
+        entity: 'voter_authorizations',
+        entityId: id,
+        before: beforeAuth,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] AUTHORIZATION_UPDATED failed:', e.message); }
     return result.rows[0];
   }
 
   /**
    * Delete an authorization
    */
-  async delete(id) {
+  async delete(id, journalCtx = {}) {
+    const beforeDel = await this.findByIdSimple(id);
     const result = await db.query(
       'DELETE FROM voter_authorizations WHERE id = $1 RETURNING id',
       [id]
     );
+    try {
+      changeJournal.record({
+        operation: 'AUTHORIZATION_DELETED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('auth-delete'),
+        entity: 'voter_authorizations',
+        entityId: id,
+        before: beforeDel,
+        after: null,
+        success: true,
+      });
+    } catch (e) { console.error('[journal] AUTHORIZATION_DELETED failed:', e.message); }
     return result.rows[0] || null;
   }
 

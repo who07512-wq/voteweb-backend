@@ -8,6 +8,8 @@
  */
 
 const db = require('../db');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 class CandidateService {
   /**
@@ -235,7 +237,7 @@ class CandidateService {
    * Used by approval/assign-ballot flows. Duplicate (position_id, name)
    * surfaces as 23505 for the caller to swallow; unknown position as 23503.
    */
-  async create({ position_id, name, description = null, image_url = null }) {
+  async create({ position_id, name, description = null, image_url = null }, journalCtx = {}) {
     const result = await db.query(
       `INSERT INTO candidates (position_id, name, description, image_url, display_order)
        VALUES ($1, $2, $3, $4,
@@ -243,14 +245,29 @@ class CandidateService {
        RETURNING *`,
       [position_id, name, description, image_url]
     );
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_BALLOT_CREATED',
+        source: journalCtx.source || 'system',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'SYSTEM',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-create'),
+        entity: 'candidates',
+        entityId: result.rows[0].id,
+        before: null,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] CANDIDATE_BALLOT_CREATED failed:', e.message); }
     return result.rows[0];
   }
 
   /**
    * Update candidate (legacy)
    */
-  async update(id, data) {
+  async update(id, data, journalCtx = {}) {
     const { name, description, image_url, display_order } = data;
+    const before = await this.findByIdSimple(id);
 
     const result = await db.query(`
       UPDATE candidates
@@ -263,6 +280,20 @@ class CandidateService {
       RETURNING *
     `, [id, name, description, image_url, display_order]);
 
+    try {
+      changeJournal.record({
+        operation: 'CANDIDATE_BALLOT_UPDATED',
+        source: journalCtx.source || 'admin-api',
+        actorId: journalCtx.actorId || null,
+        actorType: journalCtx.actorType || 'ADMIN',
+        requestId: journalCtx.requestId || systemCorrelationId('candidate-update'),
+        entity: 'candidates',
+        entityId: id,
+        before,
+        after: result.rows[0],
+        success: true,
+      });
+    } catch (e) { console.error('[journal] CANDIDATE_BALLOT_UPDATED failed:', e.message); }
     return result.rows[0];
   }
 }

@@ -35,7 +35,36 @@ async function startServer() {
     console.log(`Environment: ${config.env}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
     console.log(`Database health: http://localhost:${PORT}/api/health/db`);
+    console.log(`Backup health: http://localhost:${PORT}/api/health/backup`);
   });
+
+  // Verify Appwrite backup/journal configuration at startup (observable, not blocking for non-destructive)
+  (async () => {
+    const changeJournal = require('./services/changeJournal');
+    const backupScheduler = require('./services/backupScheduler');
+    try {
+      const jh = await changeJournal.healthCheck();
+      if (!jh.configured) {
+        console.warn(`[startup] WARNING: change journal not configured — ${jh.error}. Journal durability is degraded (local fallback only).`);
+        if (process.env.NODE_ENV === 'production') {
+          console.warn('[startup] In production, journal misconfiguration will still allow startup but destructive migrations will be BLOCKED (fail-closed).');
+        }
+      } else {
+        console.log(`[startup] change journal bucket OK: ${jh.bucketId} (private)`);
+      }
+    } catch (e) {
+      console.warn('[startup] journal health check failed:', e.message);
+    }
+    const bs = backupScheduler.getStatus();
+    if (!bs.configured) {
+      console.warn('[startup] WARNING: backup storage not configured — scheduled snapshots disabled. Pre-deploy destructive gate will BLOCK deployments (fail-closed).');
+    } else {
+      console.log(`[startup] backup scheduler OK: interval ${bs.intervalHours}h, retention ${bs.retention.regular}/${bs.retention.preDeploy}, journal permanent`);
+    }
+    if (process.env.NODE_ENV === 'production' && !bs.configured) {
+      console.warn('[startup] PRODUCTION: missing backup infra means ANY pending destructive migration will fail deployment safely. Configure APPWRITE_* to unblock.');
+    }
+  })();
 
   // Scheduled DB snapshot backups to Appwrite Storage (no-op when not
   // configured). See src/services/backupScheduler.js.

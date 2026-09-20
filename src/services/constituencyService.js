@@ -9,6 +9,8 @@
  */
 
 const db = require('../db');
+const changeJournal = require('./changeJournal');
+const { systemCorrelationId } = require('../middleware/requestId');
 
 // Each class constituency exposes two lock-step Class Representative seats —
 // one Boy CR and one Girl CR — so a class votes for one boy and one girl rep.
@@ -123,6 +125,25 @@ class ConstituencyService {
     } finally {
       client.release();
     }
+
+    try {
+      const positions = await db.query(`SELECT * FROM positions WHERE constituency_id=$1`, [constituency.id]);
+      changeJournal.record({
+        operation: 'CONSTITUENCY_CREATED',
+        source: 'admin-api',
+        actorType: 'ADMIN',
+        requestId: systemCorrelationId('constituency-create'),
+        entity: 'constituencies',
+        entityId: constituency.id,
+        before: null,
+        after: constituency,
+        affectedRows: {
+          constituencies: [{ before: null, after: constituency }],
+          positions: positions.rows.map(p => ({ before: null, after: p })),
+        },
+        success: true,
+      });
+    } catch (e) { console.error('[journal] CONSTITUENCY_CREATED failed:', e.message); }
 
     return constituency;
   }

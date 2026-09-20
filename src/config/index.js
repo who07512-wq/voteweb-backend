@@ -43,6 +43,13 @@ const config = {
  
   // Database SSL
   dbSsl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+
+  // Production Migration Safety
+  allowDestructiveMigrations: process.env.ALLOW_DESTRUCTIVE_MIGRATIONS === 'true',
+  backupRetentionCount: parseInt(process.env.BACKUP_RETENTION_COUNT, 10) || 90,
+  backupRetentionPreDeploy: parseInt(process.env.BACKUP_RETENTION_PRE_DEPLOY, 10) || 30,
+  appwriteJournalBucket: process.env.APPWRITE_JOURNAL_BUCKET || 'db-change-journal',
+  appwriteBackupsBucket: process.env.APPWRITE_BACKUPS_BUCKET || 'db-backups',
 };
  
 // Validate critical security settings in production
